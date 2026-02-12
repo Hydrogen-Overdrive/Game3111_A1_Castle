@@ -24,6 +24,7 @@
     <ProjectGuid>{83d3c7a0-2c62-4d85-a13c-38689288e782}</ProjectGuid>
     <RootNamespace>InitializeDirect3D</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>CastleA1</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
