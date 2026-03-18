@@ -1,7 +1,8 @@
 //***************************************************************************************
 // color.hlsl by Frank Luna (C) 2015 All Rights Reserved.
 //
-// Lighting + texturing. (A2 Part 2)
+// Texturing + lighting. (A2 Parts 1-2)
+// Water uses gAlpha for alpha blending. (A2 Part 3)
 //***************************************************************************************
 
 #define NUM_DIR_LIGHTS 1
@@ -24,8 +25,8 @@ struct Light
 cbuffer cbPerObject : register(b0)
 {
     float4x4 gWorld;
-    float gAlpha; // used for blending (water transparency)
-    float3 gBaseColorMul;
+    float gAlpha; // A2 Part 3: controls transparency for water/fountain
+    float3 gBaseColorMul; // A2 Part 3: multiply sampled color (ex: black trench bottom)
     float gBaseColorMulPad;
 };
 
@@ -232,6 +233,7 @@ float4 PS(VertexOut pin) : SV_Target
     float4 directLight = ComputeLighting(gLights, mat, pin.PosW, normalW, toEyeW, shadowFactor);
     float4 litColor = ambient + directLight;
 
+    // A2 Part 3: this alpha is used by the transparent PSO (alpha blending).
     litColor.a = gAlpha;
     return litColor;
 }
