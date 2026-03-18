@@ -7,6 +7,10 @@
 struct ObjectConstants
 {
     DirectX::XMFLOAT4X4 World = MathHelper::Identity4x4();
+    float Alpha = 1.0f;
+    DirectX::XMFLOAT3 BaseColorMul = { 1.0f, 1.0f, 1.0f };
+    float BaseColorMulPad = 0.0f;
+    DirectX::XMFLOAT3 PaddingAlpha = { 0.0f, 0.0f, 0.0f }; // 16-byte alignment
 };
 
 struct PassConstants
@@ -25,12 +29,18 @@ struct PassConstants
     float FarZ = 0.0f;
     float TotalTime = 0.0f;
     float DeltaTime = 0.0f;
+
+    // A2 Part 2 (Lighting): constant data for lighting calculations in the pixel shader.
+    // Kept appended at the end so earlier cbPass members keep their original offsets.
+    DirectX::XMFLOAT4 AmbientLight = { 0.0f, 0.0f, 0.0f, 1.0f };
+    Light Lights[MaxLights];
 };
 
 struct Vertex
 {
     DirectX::XMFLOAT3 Pos;
-    DirectX::XMFLOAT4 Color;
+    DirectX::XMFLOAT3 Normal;
+    DirectX::XMFLOAT2 TexC;
 };
 
 // Step2: we usually use a circular array of three frame resource elements.The idea is that for frame n, the CPU will

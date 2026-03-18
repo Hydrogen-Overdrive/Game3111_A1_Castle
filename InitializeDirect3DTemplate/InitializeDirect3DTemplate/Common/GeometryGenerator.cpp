@@ -1,5 +1,6 @@
 #include "GeometryGenerator.h"
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 using namespace DirectX;
@@ -243,5 +244,189 @@ GeometryGenerator::MeshData GeometryGenerator::CreateWedge(float width, float he
         Vertex(w2, -h2,  d2, 0,0, 1, 1,0,0, 1,1)
     };
     meshData.Indices32 = { 0,1,2, 3,5,4, 0,2,5, 0,5,3, 1,4,5, 1,5,2, 0,3,4, 0,4,1 };
+    return meshData;
+}
+
+GeometryGenerator::MeshData GeometryGenerator::CreateCone(float radius, float height, uint32 sliceCount)
+{
+    MeshData meshData;
+
+    // Create a cone mesh (sides + base cap).
+    float yBase = -0.5f * height;
+    float yApex = 0.5f * height;
+
+    const uint32 ringVertexCount = sliceCount + 1;
+    for (uint32 i = 0; i < ringVertexCount; ++i)
+    {
+        float theta = i * (2.0f * XM_PI / sliceCount);
+        float c = cosf(theta);
+        float s = sinf(theta);
+
+        XMFLOAT3 p(radius * c, yBase, radius * s);
+
+        XMFLOAT3 n(c, radius / height, s);
+        XMVECTOR nVec = XMVector3Normalize(XMLoadFloat3(&n));
+        XMStoreFloat3(&n, nVec);
+
+        XMFLOAT3 t(-s, 0.0f, c);
+
+        float u = static_cast<float>(i) / sliceCount;
+        float v = 1.0f;
+
+        meshData.Vertices.push_back(Vertex(p.x, p.y, p.z, n.x, n.y, n.z, t.x, t.y, t.z, u, v));
+    }
+
+    uint32 apexIndex = static_cast<uint32>(meshData.Vertices.size());
+    meshData.Vertices.push_back(
+        Vertex(0.0f, yApex, 0.0f,
+            0.0f, 1.0f, 0.0f,
+            1.0f, 0.0f, 0.0f,
+            0.5f, 0.0f));
+
+    for (uint32 i = 0; i < sliceCount; ++i)
+    {
+        meshData.Indices32.push_back(apexIndex);
+        meshData.Indices32.push_back(i + 1);
+        meshData.Indices32.push_back(i);
+    }
+
+    uint32 baseCenterIndex = static_cast<uint32>(meshData.Vertices.size());
+    meshData.Vertices.push_back(
+        Vertex(0.0f, yBase, 0.0f,
+            0.0f, -1.0f, 0.0f,
+            1.0f, 0.0f, 0.0f,
+            0.5f, 0.5f));
+
+    uint32 baseStartIndex = static_cast<uint32>(meshData.Vertices.size());
+    for (uint32 i = 0; i < ringVertexCount; ++i)
+    {
+        float theta = i * (2.0f * XM_PI / sliceCount);
+        float c = cosf(theta);
+        float s = sinf(theta);
+
+        float x = radius * c;
+        float z = radius * s;
+        XMFLOAT2 uv(x / (2.0f * radius) + 0.5f, z / (2.0f * radius) + 0.5f);
+
+        meshData.Vertices.push_back(
+            Vertex(x, yBase, z,
+                0.0f, -1.0f, 0.0f,
+                1.0f, 0.0f, 0.0f,
+                uv.x, uv.y));
+    }
+
+    for (uint32 i = 0; i < sliceCount; ++i)
+    {
+        meshData.Indices32.push_back(baseCenterIndex);
+        meshData.Indices32.push_back(baseStartIndex + i);
+        meshData.Indices32.push_back(baseStartIndex + i + 1);
+    }
+
+    return meshData;
+}
+
+GeometryGenerator::MeshData GeometryGenerator::CreateTriangularPrism(float width, float height, float depth)
+{
+    MeshData meshData;
+
+    float w2 = 0.5f * width;
+    float h2 = 0.5f * height;
+    float d2 = 0.5f * depth;
+
+    // Triangle in X/Y plane.
+    XMFLOAT3 A0(-w2, -h2, -d2);
+    XMFLOAT3 B0(+w2, -h2, -d2);
+    XMFLOAT3 C0(0.0f, +h2, -d2);
+
+    XMFLOAT3 A1(-w2, -h2, +d2);
+    XMFLOAT3 B1(+w2, -h2, +d2);
+    XMFLOAT3 C1(0.0f, +h2, +d2);
+
+    auto addVertex = [&](const XMFLOAT3& p, const XMFLOAT3& n, const XMFLOAT3& t, const XMFLOAT2& uv)
+    {
+        meshData.Vertices.push_back(Vertex(p.x, p.y, p.z, n.x, n.y, n.z, t.x, t.y, t.z, uv.x, uv.y));
+    };
+
+    auto addTri = [&](uint32 i0, uint32 i1, uint32 i2)
+    {
+        meshData.Indices32.push_back(i0);
+        meshData.Indices32.push_back(i1);
+        meshData.Indices32.push_back(i2);
+    };
+
+    // Front triangle (+Z).
+    {
+        uint32 start = static_cast<uint32>(meshData.Vertices.size());
+        XMFLOAT3 n(0.0f, 0.0f, 1.0f);
+        XMFLOAT3 t(1.0f, 0.0f, 0.0f);
+        addVertex(A1, n, t, XMFLOAT2(0.0f, 0.0f));
+        addVertex(B1, n, t, XMFLOAT2(1.0f, 0.0f));
+        addVertex(C1, n, t, XMFLOAT2(0.5f, 1.0f));
+        addTri(start + 0, start + 2, start + 1);
+    }
+
+    // Back triangle (-Z).
+    {
+        uint32 start = static_cast<uint32>(meshData.Vertices.size());
+        XMFLOAT3 n(0.0f, 0.0f, -1.0f);
+        XMFLOAT3 t(1.0f, 0.0f, 0.0f);
+        addVertex(A0, n, t, XMFLOAT2(0.0f, 0.0f));
+        addVertex(C0, n, t, XMFLOAT2(0.5f, 1.0f));
+        addVertex(B0, n, t, XMFLOAT2(1.0f, 0.0f));
+        addTri(start + 0, start + 1, start + 2);
+    }
+
+    auto buildSideQuad = [&](const XMFLOAT3& P0, const XMFLOAT3& P1, const XMFLOAT3& P2, const XMFLOAT3& P3)
+    {
+        XMVECTOR p0 = XMLoadFloat3(&P0);
+        XMVECTOR p1 = XMLoadFloat3(&P1);
+        XMVECTOR p2 = XMLoadFloat3(&P2);
+
+        XMVECTOR e0 = p1 - p0;
+        XMVECTOR e1 = p2 - p0;
+        XMVECTOR nVec = XMVector3Normalize(XMVector3Cross(e0, e1));
+        XMFLOAT3 n;
+        XMStoreFloat3(&n, nVec);
+
+        XMVECTOR tVec = XMVector3Normalize(e0);
+        XMFLOAT3 t;
+        XMStoreFloat3(&t, tVec);
+
+        uint32 start = static_cast<uint32>(meshData.Vertices.size());
+        addVertex(P0, n, t, XMFLOAT2(0.0f, 0.0f));
+        addVertex(P1, n, t, XMFLOAT2(1.0f, 0.0f));
+        addVertex(P2, n, t, XMFLOAT2(1.0f, 1.0f));
+        addVertex(P3, n, t, XMFLOAT2(0.0f, 1.0f));
+
+        addTri(start + 0, start + 2, start + 1);
+        addTri(start + 0, start + 3, start + 2);
+    };
+
+    // Side quads: AB, BC, CA.
+    buildSideQuad(A0, B0, B1, A1);
+    buildSideQuad(B0, C0, C1, B1);
+    buildSideQuad(C0, A0, A1, C1);
+
+    return meshData;
+}
+
+GeometryGenerator::MeshData GeometryGenerator::CreateDiamond(float width, float height)
+{
+    MeshData meshData;
+
+    float w2 = 0.5f * width;
+    float h2 = 0.5f * height;
+
+    const XMFLOAT3 n(0.0f, 1.0f, 0.0f);
+    const XMFLOAT3 t(1.0f, 0.0f, 0.0f);
+
+    meshData.Vertices = {
+        Vertex(0.0f, 0.0f, +h2, n.x, n.y, n.z, t.x, t.y, t.z, 0.5f, 0.0f),  // top
+        Vertex(+w2, 0.0f, 0.0f, n.x, n.y, n.z, t.x, t.y, t.z, 1.0f, 0.5f),  // right
+        Vertex(0.0f, 0.0f, -h2, n.x, n.y, n.z, t.x, t.y, t.z, 0.5f, 1.0f),  // bottom
+        Vertex(-w2, 0.0f, 0.0f, n.x, n.y, n.z, t.x, t.y, t.z, 0.0f, 0.5f)   // left
+    };
+
+    meshData.Indices32 = { 0, 2, 1, 0, 3, 2 };
     return meshData;
 }
