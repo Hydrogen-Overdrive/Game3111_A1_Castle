@@ -9,6 +9,15 @@
 #include "../../Common/GeometryGenerator.h"
 #include "FrameResource.h"
 
+/*
+Beginner guide (A2 Parts 1-4)
+Part 1 (Texturing): Load DDS textures + create SRVs; pixel shader samples `gDiffuseMap`.
+Part 2 (Lighting): `UpdateMainPassCB` fills ambient + light values; `color.hlsl` computes lighting.
+Part 3 (Water & blending): Water/fountain use `TexWater` + `Alpha` and a transparent PSO.
+Part 4 (Trees): This build draws normal 3D trees (cylinder trunk + sphere leaves). The true
+                 geometry-shader billboard version is not implemented here.
+*/
+
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 using namespace DirectX::PackedVector;
@@ -322,6 +331,7 @@ void ShapesApp::UpdateMainPassCB(const GameTimer& gt) {
     mMainPassCB.TotalTime = gt.TotalTime(); mMainPassCB.DeltaTime = gt.DeltaTime();
 
     // A2 Part 2 (Lighting): fill in lighting constants for `color.hlsl`.
+    // The pixel shader reads `gAmbientLight` and `gLights[]` from the `cbPass` cbuffer.
     mMainPassCB.AmbientLight = XMFLOAT4(0.25f, 0.25f, 0.25f, 1.0f);
 
     // Zero out all lights first.
@@ -400,6 +410,8 @@ static std::wstring GetTextureAbsPath(const wchar_t* filename, const wchar_t* te
 
 void ShapesApp::LoadTextures() {
     // Fixed texture slots used by RenderItems' TexSrvHeapIndex.
+    // A2 Part 1 (Texturing): these DDS files become GPU resources here, and SRVs
+    // are created later in `BuildTextureSRVs()` so the pixel shader can sample them.
     struct TexEntry { UINT slot; const wchar_t* file; };
     const TexEntry entries[] = {
         { TexStone, L"stone.dds" },
@@ -504,6 +516,10 @@ void ShapesApp::BuildRootSignature() {
     texTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
 
     CD3DX12_ROOT_PARAMETER slotRootParameter[3];
+    // Root parameter order (matches Draw()):
+    //  slot 0 -> cbPerObject (register b0)
+    //  slot 1 -> cbPass      (register b1)
+    //  slot 2 -> texture SRV table used by the pixel shader (register t0)
     slotRootParameter[0].InitAsDescriptorTable(1, &cbvTable0);
     slotRootParameter[1].InitAsDescriptorTable(1, &cbvTable1);
 
@@ -734,6 +750,9 @@ void ShapesApp::BuildPSOs() {
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&opaqueWireframePsoDesc, IID_PPV_ARGS(&mPSOs["opaque_wireframe"])));
 
     // Transparent PSO (Week6 blending style).
+    // A2 Part 3 (Water & blending):
+    // - Alpha blending is enabled
+    // - Depth writes are disabled so transparent surfaces don't occlude each other
     D3D12_GRAPHICS_PIPELINE_STATE_DESC transparentPsoDesc = opaquePsoDesc;
     D3D12_RENDER_TARGET_BLEND_DESC transparencyBlendDesc;
     transparencyBlendDesc.BlendEnable = true;
@@ -768,9 +787,15 @@ void ShapesApp::BuildRenderItems()
 {
     UINT objCBIndex = 0;
 
+    // A1 extra shapes (so you can point to them during demo):
+    // - diamond: fountain basin (center of the yard) + gate window inner medallion
+    // - cone: fountain water jets + tower finial spike
+    // - triPrism: tower finial triangular cap pieces
+    // - wedge: gate window outer "hex" segments (6 wedges around)
+
     // (Ground tiles added after moat constants, so we can cut out the moat region.)
 
-    // 2. MOAT WATER (segmented channel around the castle)
+    // A2 Part 3 (Water & blending): MOAT WATER (segmented channel around the castle)
     // We replace the single 60x60 quad with 8 smaller quads:
     // - 4 outer edge strips
     // - 4 corner blocks
@@ -1372,6 +1397,9 @@ void ShapesApp::BuildRenderItems()
     }
 
     // 4. TREES (symmetric ring around the moat)
+    // A2 Part 4 note:
+    // The assignment describes geometry-shader billboard trees, but this build renders
+    // normal 3D trees (cylinder trunk + sphere leaves) for the demo.
     const float treeRadius = 34.0f;
     for (int i = 0; i < 12; ++i) {
         float angle = i * (XM_2PI / 12.0f);
