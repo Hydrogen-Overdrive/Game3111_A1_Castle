@@ -1,35 +1,32 @@
-// color.hlsl — based on Frank Luna (C) 2015.
-// Textured Blinn-Phong: gDiffuseMap (t0), gLights and gAmbientLight from cbPass.
-// Transparent water (gAlpha < 1): same texture; UVs are animated in the pixel shader using gTotalTime (see below).
+// treeBillboard.hlsl — foliage as billboards (point list, geometry shader expands to two crossed quads).
+// C++: BuildTreeBillboardGeometry stores half-width and half-height in vertex TexC; lighting matches color.hlsl.
 
 #define NUM_DIR_LIGHTS 1
 #define NUM_POINT_LIGHTS 3
 #define NUM_SPOT_LIGHTS 0
-
 #define MaxLights 16
 
 struct Light
 {
     float3 Strength;
-    float FalloffStart; // point/spot light only
-    float3 Direction;   // directional/spot light only
-    float FalloffEnd;   // point/spot light only
-    float3 Position;    // point light only
-    float SpotPower;    // spot light only
+    float FalloffStart;
+    float3 Direction;
+    float FalloffEnd;
+    float3 Position;
+    float SpotPower;
 };
 
 cbuffer cbPerObject : register(b0)
 {
     float4x4 gWorld;
-    float gAlpha;            // 1 = opaque; less than 1 = alpha-blended (water). Set from C++.
-    float3 gBaseColorMul;    // multiply albedo after sampling (e.g. darken trench floor)
+    float gAlpha;
+    float3 gBaseColorMul;
     float gBaseColorMulPad;
-    float gWaterSurfaceUv;   // unused here; keeps cbuffer size aligned with C++ and treeBillboard.hlsl
+    float gWaterSurfaceUv; // unused; matches color.hlsl / C++ padding
     float gPadCb0;
     float gPadCb1;
 };
 
-// Per-pass data (camera + lighting).
 cbuffer cbPass : register(b1)
 {
     float4x4 gView;
@@ -46,10 +43,7 @@ cbuffer cbPass : register(b1)
     float gFarZ;
     float gTotalTime;
     float gDeltaTime;
-
     float4 gAmbientLight;
-    // Indices [0, NUM_DIR_LIGHTS) are directional lights;
-    // indices [NUM_DIR_LIGHTS, NUM_DIR_LIGHTS+NUM_POINT_LIGHTS) are point lights.
     Light gLights[MaxLights];
 };
 
@@ -62,7 +56,6 @@ struct Material
 
 float CalcAttenuation(float d, float falloffStart, float falloffEnd)
 {
-    // Linear falloff.
     return saturate((falloffEnd - d) / (falloffEnd - falloffStart));
 }
 
@@ -78,12 +71,10 @@ float3 BlinnPhong(float3 lightStrength, float3 lightVec, float3 normal, float3 t
 {
     const float m = mat.Shininess * 256.0f;
     float3 halfVec = normalize(toEye + lightVec);
-
     float roughnessFactor = (m + 8.0f) * pow(max(dot(halfVec, normal), 0.0f), m) / 8.0f;
     float3 fresnelFactor = SchlickFresnel(mat.FresnelR0, halfVec, lightVec);
     float3 specAlbedo = fresnelFactor * roughnessFactor;
-
-    specAlbedo = specAlbedo / (specAlbedo + 1.0f); // LDR scaling
+    specAlbedo = specAlbedo / (specAlbedo + 1.0f);
     return (mat.DiffuseAlbedo.rgb + specAlbedo) * lightStrength;
 }
 
@@ -99,41 +90,13 @@ float3 ComputePointLight(Light L, Material mat, float3 pos, float3 normal, float
 {
     float3 lightVec = L.Position - pos;
     float d = length(lightVec);
-
-    // Range test.
     if (d > L.FalloffEnd)
         return 0.0f;
-
-    lightVec /= d; // normalize
-
-    float ndotl = max(dot(lightVec, normal), 0.0f);
-    float3 lightStrength = L.Strength * ndotl;
-
-    float att = CalcAttenuation(d, L.FalloffStart, L.FalloffEnd);
-    lightStrength *= att;
-
-    return BlinnPhong(lightStrength, lightVec, normal, toEye, mat);
-}
-
-float3 ComputeSpotLight(Light L, Material mat, float3 pos, float3 normal, float3 toEye)
-{
-    // Not used in this project (NUM_SPOT_LIGHTS = 0).
-    float3 lightVec = L.Position - pos;
-    float d = length(lightVec);
-    if (d > L.FalloffEnd)
-        return 0.0f;
-
     lightVec /= d;
-
     float ndotl = max(dot(lightVec, normal), 0.0f);
     float3 lightStrength = L.Strength * ndotl;
-
     float att = CalcAttenuation(d, L.FalloffStart, L.FalloffEnd);
     lightStrength *= att;
-
-    float spotFactor = pow(max(dot(-lightVec, L.Direction), 0.0f), L.SpotPower);
-    lightStrength *= spotFactor;
-
     return BlinnPhong(lightStrength, lightVec, normal, toEye, mat);
 }
 
@@ -142,29 +105,15 @@ float4 ComputeLighting(Light gLights[MaxLights], Material mat,
     float3 shadowFactor)
 {
     float3 result = 0.0f;
-
     int i = 0;
 #if (NUM_DIR_LIGHTS > 0)
     for (i = 0; i < NUM_DIR_LIGHTS; ++i)
-    {
         result += shadowFactor[i] * ComputeDirectionalLight(gLights[i], mat, normal, toEye);
-    }
 #endif
-
 #if (NUM_POINT_LIGHTS > 0)
     for (i = NUM_DIR_LIGHTS; i < NUM_DIR_LIGHTS + NUM_POINT_LIGHTS; ++i)
-    {
         result += ComputePointLight(gLights[i], mat, pos, normal, toEye);
-    }
 #endif
-
-#if (NUM_SPOT_LIGHTS > 0)
-    for (i = NUM_DIR_LIGHTS + NUM_POINT_LIGHTS; i < NUM_DIR_LIGHTS + NUM_POINT_LIGHTS + NUM_SPOT_LIGHTS; ++i)
-    {
-        result += ComputeSpotLight(gLights[i], mat, pos, normal, toEye);
-    }
-#endif
-
     return float4(result, 0.0f);
 }
 
@@ -175,7 +124,22 @@ struct VertexIn
     float2 TexC : TEXCOORD;
 };
 
-struct VertexOut
+struct GSIn
+{
+    float3 CenterW : POSITION;
+    float2 HalfSize : TEXCOORD0;
+};
+
+GSIn VS(VertexIn vin)
+{
+    GSIn o;
+    float4 posW = mul(float4(vin.PosL, 1.0f), gWorld);
+    o.CenterW = posW.xyz;
+    o.HalfSize = vin.TexC;
+    return o;
+}
+
+struct PSIn
 {
     float4 PosH : SV_POSITION;
     float3 PosW : POSITION;
@@ -183,55 +147,77 @@ struct VertexOut
     float2 TexC : TEXCOORD;
 };
 
-VertexOut VS(VertexIn vin)
-{
-    VertexOut vout = (VertexOut)0.0f;
-
-    float4 posW = mul(float4(vin.PosL, 1.0f), gWorld);
-    vout.PosW = posW.xyz;
-
-    // Assumes non-uniform scaling; for a production pipeline you would use inverse-transpose.
-    vout.NormalW = mul(vin.NormalL, (float3x3)gWorld);
-
-    vout.PosH = mul(posW, gViewProj);
-    vout.TexC = vin.TexC;
-    return vout;
-}
-
 Texture2D gDiffuseMap : register(t0);
 SamplerState gsamAnisotropicWrap : register(s0);
 
-float4 PS(VertexOut pin) : SV_Target
+void EmitQuad(inout TriangleStream<PSIn> triStream, float3 c, float3 axisW, float3 axisH, float3 nFace)
 {
-    float2 uv = pin.TexC;
-    float4 diffuseAlbedo;
-    if (gAlpha < 1.0f)
-    {
-        // Moving water: sample world XZ so motion matches across moat/ocean tiles; mip 0 avoids streaky LOD on thin strips.
-        // gTotalTime scrolls the pattern; tweak the float constants for speed or scale. rgb tint adjusts perceived water color.
-        float2 flow = pin.PosW.xz * 0.09f + float2(gTotalTime * 0.11f, gTotalTime * 0.085f);
-        float2 ripple = 0.028f * float2(
-            sin(flow.x * 2.0f + gTotalTime * 1.7f),
-            cos(flow.y * 1.85f + gTotalTime * 1.5f));
-        uv = flow + ripple;
-        diffuseAlbedo = gDiffuseMap.SampleLevel(gsamAnisotropicWrap, uv, 0.0f);
-        diffuseAlbedo.rgb *= float3(0.66f, 0.76f, 0.91f);
-    }
+    float3 p0 = c - axisW - axisH;
+    float3 p1 = c + axisW - axisH;
+    float3 p2 = c - axisW + axisH;
+    float3 p3 = c + axisW + axisH;
+    float2 uv0 = float2(0.0f, 1.0f);
+    float2 uv1 = float2(1.0f, 1.0f);
+    float2 uv2 = float2(0.0f, 0.0f);
+    float2 uv3 = float2(1.0f, 0.0f);
+    PSIn o0, o1, o2, o3, o4, o5;
+    o0.PosW = p0; o0.PosH = mul(float4(p0, 1.0f), gViewProj); o0.NormalW = nFace; o0.TexC = uv0;
+    o1.PosW = p1; o1.PosH = mul(float4(p1, 1.0f), gViewProj); o1.NormalW = nFace; o1.TexC = uv1;
+    o2.PosW = p2; o2.PosH = mul(float4(p2, 1.0f), gViewProj); o2.NormalW = nFace; o2.TexC = uv2;
+    o3.PosW = p1; o3.PosH = mul(float4(p1, 1.0f), gViewProj); o3.NormalW = nFace; o3.TexC = uv1;
+    o4.PosW = p3; o4.PosH = mul(float4(p3, 1.0f), gViewProj); o4.NormalW = nFace; o4.TexC = uv3;
+    o5.PosW = p2; o5.PosH = mul(float4(p2, 1.0f), gViewProj); o5.NormalW = nFace; o5.TexC = uv2;
+    triStream.Append(o0);
+    triStream.Append(o1);
+    triStream.Append(o2);
+    triStream.RestartStrip();
+    triStream.Append(o3);
+    triStream.Append(o4);
+    triStream.Append(o5);
+}
+
+[maxvertexcount(12)]
+void GS(point GSIn input[1], inout TriangleStream<PSIn> triStream)
+{
+    float3 c = input[0].CenterW;
+    float hw = input[0].HalfSize.x;
+    float hh = input[0].HalfSize.y;
+    float3 look = normalize(gEyePosW - c);
+    float3 upW = float3(0.0f, 1.0f, 0.0f);
+    float3 right = normalize(cross(upW, look));
+    if (dot(right, right) < 1e-8f)
+        right = float3(1.0f, 0.0f, 0.0f);
+    float3 right2 = float3(-right.z, 0.0f, right.x);
+    if (dot(right2, right2) < 1e-8f)
+        right2 = float3(0.0f, 0.0f, 1.0f);
     else
-    {
-        diffuseAlbedo = gDiffuseMap.Sample(gsamAnisotropicWrap, uv);
-    }
+        right2 = normalize(right2);
+
+    float3 n1 = normalize(cross(right, upW));
+    if (dot(n1, look) < 0.0f)
+        n1 = -n1;
+    float3 n2 = normalize(cross(right2, upW));
+    if (dot(n2, look) < 0.0f)
+        n2 = -n2;
+
+    EmitQuad(triStream, c, right * hw, upW * hh, n1);
+    EmitQuad(triStream, c, right2 * hw, upW * hh, n2);
+}
+
+float4 PS(PSIn pin) : SV_Target
+{
+    float4 diffuseAlbedo = gDiffuseMap.Sample(gsamAnisotropicWrap, pin.TexC);
+    if (diffuseAlbedo.a < 0.25f)
+        discard;
     diffuseAlbedo.rgb *= gBaseColorMul;
-
-    // Interpolating normal can unnormalize it.
-    float3 normalW = normalize(pin.NormalW);
-
-    // Vector from point being lit to eye (normalized).
+    float crown = saturate(pin.TexC.y);
+    diffuseAlbedo.rgb *= lerp(0.45f, 1.0f, crown);
+    diffuseAlbedo.rgb = lerp(diffuseAlbedo.rgb, diffuseAlbedo.rgb * float3(0.55f, 0.75f, 0.35f), 0.22f * (1.0f - crown));
+    float3 normalW = normalize(gEyePosW - pin.PosW);
     float3 toEyeW = gEyePosW - pin.PosW;
     float distToEye = length(toEyeW);
     toEyeW /= distToEye;
 
-    // Fixed material constants for this assignment.
     static const float3 gFresnelR0 = float3(0.02f, 0.02f, 0.02f);
     static const float gRoughness = 0.35f;
     const float shininess = 1.0f - gRoughness;
@@ -242,12 +228,9 @@ float4 PS(VertexOut pin) : SV_Target
     mat.Shininess = shininess;
 
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
-
     float4 ambient = gAmbientLight * diffuseAlbedo;
     float4 directLight = ComputeLighting(gLights, mat, pin.PosW, normalW, toEyeW, shadowFactor);
     float4 litColor = ambient + directLight;
-
     litColor.a = gAlpha;
     return litColor;
 }
-

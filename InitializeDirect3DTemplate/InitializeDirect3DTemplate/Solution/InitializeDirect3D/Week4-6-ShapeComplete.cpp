@@ -1,5 +1,15 @@
 /** @file Week4-6-ShapeComplete.cpp
- * @brief Full Enclosed Castle Assignment - Final Submission.
+ *  Direct3D 12 castle scene: textured meshes, lighting, blended water, billboard trees (geometry shader).
+ *
+ *  Quick reference (where things live):
+ *  - Textures: LoadTextures() maps each DDS file to a TextureSlot; each RenderItem uses TexSrvHeapIndex to pick one.
+ *  - Changing a surface color: swap the DDS, or multiply with BaseColorMul (shader gBaseColorMul), see moat floor.
+ *  - Lights: UpdateMainPassCB() writes mMainPassCB — directional sun is Lights[0], three point lights are Lights[1..3] in a ring (see positions there).
+ *  - Water placement and size: makeWater() in BuildRenderItems() sets world scale/position; thin Y scale is the water sheet thickness.
+ *  - Water look (color, motion, opacity): Shaders/color.hlsl pixel shader — tint multiply, gTotalTime drives scrolling on world XZ; makeWater sets Alpha (higher = less transparent).
+ *  - Fountain / waterfall: same water shader; per-piece Alpha on splashCore, splashRingJet, waterColumn.
+ *  - Trees: BuildTreeBillboardGeometry() — TexC per vertex is half-width and half-height; tree ring and height at end of BuildRenderItems(); DrawBillboardTrees() uses tree_billboard PSO.
+ *  - Blending: BuildPSOs() defines mPSOs["transparent"]; items using TexWater are drawn with that state (see Draw()).
  */
 
 #include "../../Common/d3dApp.h"
@@ -8,15 +18,6 @@
 #include "../../Common/DDSTextureLoader.h"
 #include "../../Common/GeometryGenerator.h"
 #include "FrameResource.h"
-
-/*
-Beginner guide (A2 Parts 1-4)
-Part 1 (Texturing): Load DDS textures + create SRVs; pixel shader samples `gDiffuseMap`.
-Part 2 (Lighting): `UpdateMainPassCB` fills ambient + light values; `color.hlsl` computes lighting.
-Part 3 (Water & blending): Water/fountain use `TexWater` + `Alpha` and a transparent PSO.
-Part 4 (Trees): This build draws normal 3D trees (cylinder trunk + sphere leaves). The true
-                 geometry-shader billboard version is not implemented here.
-*/
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -31,12 +32,12 @@ struct RenderItem
     int NumFramesDirty = gNumFrameResources;
     UINT ObjCBIndex = -1;
     UINT TexSrvHeapIndex = 0; // texture SRV index in the shader-visible SRV heap
-    float Alpha = 1.0f;       // used for blending (water transparency)
-    // Lets us override (tint/multiply) the sampled texture color per object.
-    // Used for the moat trench bottom to avoid green ground reflections.
-    XMFLOAT3 BaseColorMul = { 1.0f, 1.0f, 1.0f };
+    float Alpha = 1.0f;          // < 1.0 draws with the transparent PSO (water, fountain); shader uses gAlpha
+    float WaterSurfaceUv = 0.0f; // copied to GPU cbuffer for layout (must match ObjectConstants / tree shader)
+    XMFLOAT3 BaseColorMul = { 1.0f, 1.0f, 1.0f }; // multiplies texture after sampling (e.g. black moat floor)
     MeshGeometry* Geo = nullptr;
     D3D12_PRIMITIVE_TOPOLOGY PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    bool BillboardTree = false;
     UINT IndexCount = 0;
     UINT StartIndexLocation = 0;
     int BaseVertexLocation = 0;
@@ -73,10 +74,12 @@ private:
     void BuildRootSignature();
     void BuildShadersAndInputLayout();
     void BuildShapeGeometry();
+    void BuildTreeBillboardGeometry();
     void BuildPSOs();
     void BuildFrameResources();
     void BuildRenderItems();
     void DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems);
+    void DrawBillboardTrees(ID3D12GraphicsCommandList* cmdList);
 
 private:
 
@@ -105,11 +108,11 @@ private:
         TexStoneTop = 2,     // different stone for tower domes
         TexBrickBase = 3,    // wall body / base brick
         TexBrickTop = 4,     // battlement / wall top brick
-        TexWood = 5,         // gate + tree trunks
+        TexWood = 5,         // gate + wood props
         TexWoodBridge = 6,  // drawbridge wood variation
         TexGrass = 7,        // ground
         TexWater = 8,        // water
-        TexTreeLeaves = 9,   // tree leaves
+        TexTreeLeaves = 9,   // treearray.dds — billboard trees (treeBillboard.hlsl)
     };
 
     struct TextureData
@@ -123,6 +126,7 @@ private:
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
     std::vector<std::unique_ptr<RenderItem>> mAllRitems;
     std::vector<RenderItem*> mOpaqueRitems;
+    std::vector<RenderItem*> mBillboardTreeRitems;
     std::vector<RenderItem*> mTransparentRitems;
 
     PassConstants mMainPassCB;
@@ -167,6 +171,7 @@ bool ShapesApp::Initialize()
     BuildRootSignature();
     BuildShadersAndInputLayout();
     BuildShapeGeometry();
+    BuildTreeBillboardGeometry();
     BuildRenderItems();
     BuildFrameResources();
     BuildDescriptorHeaps();
@@ -236,6 +241,8 @@ void ShapesApp::Draw(const GameTimer& gt)
     mCommandList->SetGraphicsRootDescriptorTable(1, passCbvHandle);
 
     DrawRenderItems(mCommandList.Get(), mOpaqueRitems);
+
+    DrawBillboardTrees(mCommandList.Get());
 
     if (!mIsWireframe && !mTransparentRitems.empty()) {
         mCommandList->SetPipelineState(mPSOs["transparent"].Get());
@@ -311,6 +318,7 @@ void ShapesApp::UpdateObjectCBs(const GameTimer& gt) {
             XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
             objConstants.Alpha = e->Alpha;
             objConstants.BaseColorMul = e->BaseColorMul;
+            objConstants.WaterSurfaceUv = e->WaterSurfaceUv;
             currObjectCB->CopyData(e->ObjCBIndex, objConstants);
             e->NumFramesDirty--;
         }
@@ -330,11 +338,10 @@ void ShapesApp::UpdateMainPassCB(const GameTimer& gt) {
     mMainPassCB.NearZ = 1.0f; mMainPassCB.FarZ = 1000.0f;
     mMainPassCB.TotalTime = gt.TotalTime(); mMainPassCB.DeltaTime = gt.DeltaTime();
 
-    // A2 Part 2 (Lighting): fill in lighting constants for `color.hlsl`.
-    // The pixel shader reads `gAmbientLight` and `gLights[]` from the `cbPass` cbuffer.
+    // Pass constants feed color.hlsl and treeBillboard.hlsl (gAmbientLight, gLights, gTotalTime).
     mMainPassCB.AmbientLight = XMFLOAT4(0.25f, 0.25f, 0.25f, 1.0f);
 
-    // Zero out all lights first.
+    // Clear the light array, then fill only the slots we use.
     for (int i = 0; i < MaxLights; ++i) {
         mMainPassCB.Lights[i].Strength = XMFLOAT3(0.0f, 0.0f, 0.0f);
         mMainPassCB.Lights[i].FalloffStart = 0.0f;
@@ -344,11 +351,11 @@ void ShapesApp::UpdateMainPassCB(const GameTimer& gt) {
         mMainPassCB.Lights[i].SpotPower = 0.0f;
     }
 
-    // Directional light (index 0).
-    mMainPassCB.Lights[0].Strength = XMFLOAT3(1.0f, 1.0f, 1.0f);
+    // Lights[0]: directional — Direction is toward the scene (here, straight down). Strength is RGB color/intensity.
+    mMainPassCB.Lights[0].Strength = XMFLOAT3(1.0f, 0.92f, 0.78f);
     mMainPassCB.Lights[0].Direction = XMFLOAT3(0.0f, -1.0f, 0.0f);
 
-    // Point lights (indices 1..3) placed symmetrically around the center.
+    // Lights[1..3]: point lights on a horizontal ring at y = 10 (warm accent). FalloffStart/End control reach.
     const float ringRadius = 30.0f;
     const float y = 10.0f;
     for (int pi = 0; pi < 3; ++pi) {
@@ -357,7 +364,7 @@ void ShapesApp::UpdateMainPassCB(const GameTimer& gt) {
         float z = ringRadius * sinf(a);
 
         auto& L = mMainPassCB.Lights[1 + pi];
-        L.Strength = XMFLOAT3(0.75f, 0.75f, 0.75f);
+        L.Strength = XMFLOAT3(0.95f, 0.28f, 0.12f);
         L.Position = XMFLOAT3(x, y, z);
         L.FalloffStart = 5.0f;
         L.FalloffEnd = 120.0f;
@@ -409,9 +416,7 @@ static std::wstring GetTextureAbsPath(const wchar_t* filename, const wchar_t* te
 }
 
 void ShapesApp::LoadTextures() {
-    // Fixed texture slots used by RenderItems' TexSrvHeapIndex.
-    // A2 Part 1 (Texturing): these DDS files become GPU resources here, and SRVs
-    // are created later in `BuildTextureSRVs()` so the pixel shader can sample them.
+    // Each entry must match TextureSlot order; RenderItem::TexSrvHeapIndex picks which DDS is sampled as gDiffuseMap.
     struct TexEntry { UINT slot; const wchar_t* file; };
     const TexEntry entries[] = {
         { TexStone, L"stone.dds" },
@@ -543,6 +548,9 @@ void ShapesApp::BuildRootSignature() {
 void ShapesApp::BuildShadersAndInputLayout() {
     mShaders["standardVS"] = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "VS", "vs_5_1");
     mShaders["opaquePS"] = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "PS", "ps_5_1");
+    mShaders["treeVS"] = d3dUtil::CompileShader(L"Shaders\\treeBillboard.hlsl", nullptr, "VS", "vs_5_1");
+    mShaders["treeGS"] = d3dUtil::CompileShader(L"Shaders\\treeBillboard.hlsl", nullptr, "GS", "gs_5_1");
+    mShaders["treePS"] = d3dUtil::CompileShader(L"Shaders\\treeBillboard.hlsl", nullptr, "PS", "ps_5_1");
     mInputLayout = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
@@ -728,6 +736,41 @@ void ShapesApp::BuildShapeGeometry()
     mGeometries[geo->Name] = std::move(geo);
 }
 
+void ShapesApp::BuildTreeBillboardGeometry()
+{
+    // Each vertex is one tree root. TexC.xy = half width and half height in world units (read in treeBillboard VS/GS).
+    const int numTrees = 12;
+    std::vector<Vertex> vertices(numTrees);
+    std::vector<std::uint16_t> indices(numTrees);
+    for (int i = 0; i < numTrees; ++i) {
+        vertices[i].Pos = { 0.0f, 0.0f, 0.0f };
+        vertices[i].Normal = { 0.0f, 0.0f, 0.0f };
+        vertices[i].TexC = { 5.12f, 6.4f };
+        indices[i] = (std::uint16_t)i;
+    }
+
+    auto geo = std::make_unique<MeshGeometry>();
+    geo->Name = "treeBillboardGeo";
+    ThrowIfFailed(D3DCreateBlob(vertices.size() * sizeof(Vertex), &geo->VertexBufferCPU));
+    CopyMemory(geo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vertices.size() * sizeof(Vertex));
+    ThrowIfFailed(D3DCreateBlob(indices.size() * sizeof(std::uint16_t), &geo->IndexBufferCPU));
+    CopyMemory(geo->IndexBufferCPU->GetBufferPointer(), indices.data(), indices.size() * sizeof(std::uint16_t));
+    geo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(), mCommandList.Get(), vertices.data(), vertices.size() * sizeof(Vertex), geo->VertexBufferUploader);
+    geo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(), mCommandList.Get(), indices.data(), indices.size() * sizeof(std::uint16_t), geo->IndexBufferUploader);
+    geo->VertexByteStride = sizeof(Vertex);
+    geo->VertexBufferByteSize = vertices.size() * sizeof(Vertex);
+    geo->IndexFormat = DXGI_FORMAT_R16_UINT;
+    geo->IndexBufferByteSize = indices.size() * sizeof(std::uint16_t);
+
+    SubmeshGeometry onePoint;
+    onePoint.IndexCount = 1;
+    onePoint.StartIndexLocation = 0;
+    onePoint.BaseVertexLocation = 0;
+    geo->DrawArgs["treePoint"] = onePoint;
+
+    mGeometries[geo->Name] = std::move(geo);
+}
+
 void ShapesApp::BuildPSOs() {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC opaquePsoDesc;
     ZeroMemory(&opaquePsoDesc, sizeof(D3D12_GRAPHICS_PIPELINE_STATE_DESC));
@@ -749,10 +792,7 @@ void ShapesApp::BuildPSOs() {
     opaqueWireframePsoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&opaqueWireframePsoDesc, IID_PPV_ARGS(&mPSOs["opaque_wireframe"])));
 
-    // Transparent PSO (Week6 blending style).
-    // A2 Part 3 (Water & blending):
-    // - Alpha blending is enabled
-    // - Depth writes are disabled so transparent surfaces don't occlude each other
+    // Transparent PSO: standard alpha blend; depth writes off so multiple water layers can draw over each other.
     D3D12_GRAPHICS_PIPELINE_STATE_DESC transparentPsoDesc = opaquePsoDesc;
     D3D12_RENDER_TARGET_BLEND_DESC transparencyBlendDesc;
     transparencyBlendDesc.BlendEnable = true;
@@ -772,6 +812,27 @@ void ShapesApp::BuildPSOs() {
     // Keep depth testing enabled so transparent water blends with the
     // trench bottom (black) rather than with the green ground.
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&transparentPsoDesc, IID_PPV_ARGS(&mPSOs["transparent"])));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC treePsoDesc;
+    ZeroMemory(&treePsoDesc, sizeof(D3D12_GRAPHICS_PIPELINE_STATE_DESC));
+    treePsoDesc.InputLayout = { mInputLayout.data(), (UINT)mInputLayout.size() };
+    treePsoDesc.pRootSignature = mRootSignature.Get();
+    treePsoDesc.VS = { reinterpret_cast<BYTE*>(mShaders["treeVS"]->GetBufferPointer()), mShaders["treeVS"]->GetBufferSize() };
+    treePsoDesc.GS = { reinterpret_cast<BYTE*>(mShaders["treeGS"]->GetBufferPointer()), mShaders["treeGS"]->GetBufferSize() };
+    treePsoDesc.PS = { reinterpret_cast<BYTE*>(mShaders["treePS"]->GetBufferPointer()), mShaders["treePS"]->GetBufferSize() };
+    treePsoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    treePsoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    treePsoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    treePsoDesc.SampleMask = UINT_MAX;
+    treePsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    treePsoDesc.NumRenderTargets = 1;
+    treePsoDesc.RTVFormats[0] = mBackBufferFormat;
+    treePsoDesc.SampleDesc.Count = m4xMsaaState ? 4 : 1;
+    treePsoDesc.DSVFormat = mDepthStencilFormat;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&treePsoDesc, IID_PPV_ARGS(&mPSOs["tree_billboard"])));
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC treeWirePsoDesc = treePsoDesc;
+    treeWirePsoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&treeWirePsoDesc, IID_PPV_ARGS(&mPSOs["tree_billboard_wireframe"])));
 }
 
 void ShapesApp::BuildFrameResources() {
@@ -787,23 +848,9 @@ void ShapesApp::BuildRenderItems()
 {
     UINT objCBIndex = 0;
 
-    // A1 extra shapes (so you can point to them during demo):
-    // - diamond: fountain basin (center of the yard) + gate window inner medallion
-    // - cone: fountain water jets + tower finial spike
-    // - triPrism: tower finial triangular cap pieces
-    // - wedge: gate window outer "hex" segments (6 wedges around)
+    // Mesh names in shapeGeo (diamond, cone, etc.) are used for fountain, towers, gate, etc.
 
-    // (Ground tiles added after moat constants, so we can cut out the moat region.)
-
-    // A2 Part 3 (Water & blending): MOAT WATER (segmented channel around the castle)
-    // We replace the single 60x60 quad with 8 smaller quads:
-    // - 4 outer edge strips
-    // - 4 corner blocks
-    // This leaves a hole in the middle so the castle yard stays land.
-    // Make the water sit a bit farther away from the castle walls,
-    // while keeping the moat as a thin "channel" (not a wide puddle).
-    // Keep the moat at least ~1 "foot" away from the castle footprint.
-    // Current castle footprint extends close to +/-12, so 15..20 gives a clear gap.
+    // Moat water: eight scaled waterGrid pieces (four strips + four corners) around the yard; constants set channel width.
     const float moatInner = 15.0f; // inner edge (gap from walls)
     const float moatOuter = 20.0f; // outer edge
     const float moatThickness = moatOuter - moatInner;
@@ -872,13 +919,15 @@ void ShapesApp::BuildRenderItems()
     const float trenchWallHeight = trenchWallTopY - trenchBottomY;
     const float trenchWallCenterY = trenchBottomY + 0.5f * trenchWallHeight;
 
+    // Water surface: Alpha controls opacity in the shader; tint and scrolling are in Shaders/color.hlsl (pixel shader).
     auto makeWater = [&](float sx, float sz, float x, float z)
     {
         auto r = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&r->World,
             XMMatrixScaling(sx, 0.03f, sz) *
             XMMatrixTranslation(x, waterSurfaceY, z));
-        r->Alpha = 0.5f;
+        r->Alpha = 0.89f;
+        r->WaterSurfaceUv = 1.0f;
         r->ObjCBIndex = objCBIndex++;
         r->Geo = mGeometries["shapeGeo"].get();
         r->IndexCount = r->Geo->DrawArgs["waterGrid"].IndexCount;
@@ -929,8 +978,25 @@ void ShapesApp::BuildRenderItems()
     makeWater(cornerScale, cornerScale, -centerEdge, -centerEdge);
     makeMoatFloor(cornerScale, cornerScale, -centerEdge, -centerEdge);
 
-    // 4. CENTER FOUNTAIN (unique multi-shape decorative centerpiece)
-    // Opaque basin + pedestal + transparent water splash (reuses TexWater blending).
+    // Outer ocean: oceanInnerEdge matches outerBound so grass meets water with no gap.
+    const float oceanInnerEdge = outerBound;
+    const float oceanOuterEdge = 95.0f;
+    const float oceanMid = 0.5f * (oceanInnerEdge + oceanOuterEdge);
+    const float oceanThickness = oceanOuterEdge - oceanInnerEdge;
+    const float stripScaleXO = (2.0f * oceanOuterEdge) / waterBaseSize;
+    const float stripScaleZO = oceanThickness / waterBaseSize;
+    const float cornerScaleO = oceanThickness / waterBaseSize;
+
+    makeWater(stripScaleXO, stripScaleZO, 0.0f, +oceanMid);
+    makeWater(stripScaleXO, stripScaleZO, 0.0f, -oceanMid);
+    makeWater(stripScaleZO, stripScaleXO, +oceanMid, 0.0f);
+    makeWater(stripScaleZO, stripScaleXO, -oceanMid, 0.0f);
+    makeWater(cornerScaleO, cornerScaleO, +oceanMid, +oceanMid);
+    makeWater(cornerScaleO, cornerScaleO, +oceanMid, -oceanMid);
+    makeWater(cornerScaleO, cornerScaleO, -oceanMid, +oceanMid);
+    makeWater(cornerScaleO, cornerScaleO, -oceanMid, -oceanMid);
+
+    // Center fountain: opaque stone, then transparent TexWater cones/cylinder (each has its own Alpha).
 
     // Basin (diamond, flattened)
     auto fountainBasin = std::make_unique<RenderItem>();
@@ -1396,41 +1462,25 @@ void ShapesApp::BuildRenderItems()
         mAllRitems.push_back(std::move(tooth));
     }
 
-    // 4. TREES (symmetric ring around the moat)
-    // A2 Part 4 note:
-    // The assignment describes geometry-shader billboard trees, but this build renders
-    // normal 3D trees (cylinder trunk + sphere leaves) for the demo.
+    // Trees: one point per tree; treeBillboard.hlsl expands to two crossed quads. Size comes from TexC in BuildTreeBillboardGeometry().
     const float treeRadius = 34.0f;
     for (int i = 0; i < 12; ++i) {
         float angle = i * (XM_2PI / 12.0f);
         float x = treeRadius * cosf(angle);
         float z = treeRadius * sinf(angle);
 
-        // Trunk (cylinder)
-        auto trunk = std::make_unique<RenderItem>();
-        XMStoreFloat4x4(&trunk->World,
-            XMMatrixScaling(0.25f, 1.1f, 0.25f) *
-            XMMatrixTranslation(x, 1.65f, z));
-        trunk->ObjCBIndex = objCBIndex++;
-        trunk->Geo = mGeometries["shapeGeo"].get();
-        trunk->IndexCount = trunk->Geo->DrawArgs["cylinderTrunk"].IndexCount;
-        trunk->StartIndexLocation = trunk->Geo->DrawArgs["cylinderTrunk"].StartIndexLocation;
-        trunk->BaseVertexLocation = trunk->Geo->DrawArgs["cylinderTrunk"].BaseVertexLocation;
-        trunk->TexSrvHeapIndex = TexWood;
-        mAllRitems.push_back(std::move(trunk));
-
-        // Leaves (sphere)
-        auto leaves = std::make_unique<RenderItem>();
-        XMStoreFloat4x4(&leaves->World,
-            XMMatrixScaling(1.6f, 1.6f, 1.6f) *
-            XMMatrixTranslation(x, 3.7f, z));
-        leaves->ObjCBIndex = objCBIndex++;
-        leaves->Geo = mGeometries["shapeGeo"].get();
-        leaves->IndexCount = leaves->Geo->DrawArgs["sphereLeaves"].IndexCount;
-        leaves->StartIndexLocation = leaves->Geo->DrawArgs["sphereLeaves"].StartIndexLocation;
-        leaves->BaseVertexLocation = leaves->Geo->DrawArgs["sphereLeaves"].BaseVertexLocation;
-        leaves->TexSrvHeapIndex = TexTreeLeaves;
-        mAllRitems.push_back(std::move(leaves));
+        auto tree = std::make_unique<RenderItem>();
+        // Y equals half-height stored in vertex TexC.y so the quad bottom sits near y = 0.
+        XMStoreFloat4x4(&tree->World, XMMatrixTranslation(x, 6.48f, z));
+        tree->BillboardTree = true;
+        tree->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+        tree->ObjCBIndex = objCBIndex++;
+        tree->Geo = mGeometries["treeBillboardGeo"].get();
+        tree->IndexCount = 1;
+        tree->StartIndexLocation = (UINT)i;
+        tree->BaseVertexLocation = i;
+        tree->TexSrvHeapIndex = TexTreeLeaves;
+        mAllRitems.push_back(std::move(tree));
     }
 
     // 5. THE DRAWBRIDGE
@@ -1506,10 +1556,12 @@ void ShapesApp::BuildRenderItems()
         mAllRitems.push_back(std::move(chain));
     }
 
-    // Split opaque vs transparent lists (Week6-style blending for water).
+    // Draw order lists: TexWater uses transparent PSO; trees use tree PSO; rest opaque.
     for (auto& e : mAllRitems) {
         if (e->TexSrvHeapIndex == TexWater)
             mTransparentRitems.push_back(e.get());
+        else if (e->BillboardTree)
+            mBillboardTreeRitems.push_back(e.get());
         else
             mOpaqueRitems.push_back(e.get());
     }
@@ -1533,4 +1585,15 @@ void ShapesApp::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::v
 
         cmdList->DrawIndexedInstanced(ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
     }
+}
+
+void ShapesApp::DrawBillboardTrees(ID3D12GraphicsCommandList* cmdList)
+{
+    if (mBillboardTreeRitems.empty())
+        return;
+    if (mIsWireframe)
+        cmdList->SetPipelineState(mPSOs["tree_billboard_wireframe"].Get());
+    else
+        cmdList->SetPipelineState(mPSOs["tree_billboard"].Get());
+    DrawRenderItems(cmdList, mBillboardTreeRitems);
 }

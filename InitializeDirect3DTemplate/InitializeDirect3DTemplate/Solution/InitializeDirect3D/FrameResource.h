@@ -4,13 +4,16 @@
 #include "../../Common/MathHelper.h"
 #include "../../Common/UploadBuffer.h"
 
+// Per-object GPU constants (cb0). Layout must match Shaders/color.hlsl and treeBillboard.hlsl.
 struct ObjectConstants
 {
     DirectX::XMFLOAT4X4 World = MathHelper::Identity4x4();
     float Alpha = 1.0f;
     DirectX::XMFLOAT3 BaseColorMul = { 1.0f, 1.0f, 1.0f };
     float BaseColorMulPad = 0.0f;
-    DirectX::XMFLOAT3 PaddingAlpha = { 0.0f, 0.0f, 0.0f }; // 16-byte alignment
+    float WaterSurfaceUv = 0.0f;
+    float CbPad0 = 0.0f;
+    float CbPad1 = 0.0f;
 };
 
 struct PassConstants
@@ -30,8 +33,7 @@ struct PassConstants
     float TotalTime = 0.0f;
     float DeltaTime = 0.0f;
 
-    // A2 Part 2 (Lighting): constant data for lighting calculations in the pixel shader.
-    // Kept appended at the end so earlier cbPass members keep their original offsets.
+    // Ambient light plus directional/point lights (see UpdateMainPassCB in the app). Order must match the HLSL cbuffer.
     DirectX::XMFLOAT4 AmbientLight = { 0.0f, 0.0f, 0.0f, 1.0f };
     Light Lights[MaxLights];
 };
