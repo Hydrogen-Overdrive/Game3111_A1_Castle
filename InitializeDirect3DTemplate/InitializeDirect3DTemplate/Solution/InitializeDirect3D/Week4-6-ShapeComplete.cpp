@@ -1,15 +1,5 @@
 /** @file Week4-6-ShapeComplete.cpp
- *  Direct3D 12 castle scene: textured meshes, lighting, blended water, billboard trees (geometry shader).
- *
- *  Quick reference (where things live):
- *  - Textures: LoadTextures() maps each DDS file to a TextureSlot; each RenderItem uses TexSrvHeapIndex to pick one.
- *  - Changing a surface color: swap the DDS, or multiply with BaseColorMul (shader gBaseColorMul), see moat floor.
- *  - Lights: UpdateMainPassCB() writes mMainPassCB — directional sun is Lights[0], three point lights are Lights[1..3] in a ring (see positions there).
- *  - Water placement and size: makeWater() in BuildRenderItems() sets world scale/position; thin Y scale is the water sheet thickness.
- *  - Water look (color, motion, opacity): Shaders/color.hlsl pixel shader — tint multiply, gTotalTime drives scrolling on world XZ; makeWater sets Alpha (higher = less transparent).
- *  - Fountain / waterfall: same water shader; per-piece Alpha on splashCore, splashRingJet, waterColumn.
- *  - Trees: BuildTreeBillboardGeometry() — TexC per vertex is half-width and half-height; tree ring and height at end of BuildRenderItems(); DrawBillboardTrees() uses tree_billboard PSO.
- *  - Blending: BuildPSOs() defines mPSOs["transparent"]; items using TexWater are drawn with that state (see Draw()).
+ *  Castle scene: textures, Blinn-Phong lighting, alpha-blended water, billboard trees (geometry shader), maze walkthrough.
  */
 
 #include "../../Common/d3dApp.h"
@@ -18,6 +8,12 @@
 #include "../../Common/DDSTextureLoader.h"
 #include "../../Common/GeometryGenerator.h"
 #include "FrameResource.h"
+#include "Camera.h"
+#include "SkullTxtMesh.h"
+
+#include <cmath>
+#include <string>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -25,16 +21,93 @@ using namespace DirectX::PackedVector;
 
 const int gNumFrameResources = 3;
 
+// Billboard trees: all placed on the south “front lawn” by the water (none inside / around maze sides).
+static constexpr int kBillboardRingTrees = 0;
+static constexpr int kBillboardMazeFrontTrees = 0;
+static constexpr int kBillboardEntranceForestTrees = 84;
+static constexpr int kBillboardTreeCount = kBillboardEntranceForestTrees;
+static constexpr float kTreeBillboardHalfW = 4.5f;
+static constexpr float kTreeBillboardHalfH = 4.75f; // world Y = this so billboard base meets ground
+
+struct AxisAlignedCollider
+{
+    XMFLOAT3 Center;
+    XMFLOAT3 HalfExtents;
+};
+
+namespace MazeConfig {
+constexpr float kCell = 1.65f;
+// U-shaped (3-sided) maze: long walls on west, south, east; open north toward the castle (back).
+constexpr int kRows = 31;
+constexpr int kCols = 23;
+constexpr float kOriginX = -0.5f * kCols * kCell;
+// Maze sits in front of the castle; north edge opens to the bridge / gate (castle is the goal at the back).
+// Wall half-depth in Z matches BuildRenderItems (kCell * 0.92f).
+constexpr float kWallScaleZ = 0.92f;
+constexpr float kMazeNorthEdgeZ = -19.0f;
+constexpr float kOriginZ =
+    kMazeNorthEdgeZ - (static_cast<float>(kRows) - 0.5f + 0.5f * kWallScaleZ) * kCell;
+constexpr float kWallHeight = 3.0f;
+constexpr float kEyeHeight = 2.45f;
+constexpr float kPlayerHalfXZ = 0.38f;
+constexpr float kPlayerHalfY = 0.95f;
+constexpr float kPlayerBodyCenterY = 1.0f;
+
+inline bool AabbOverlap(const XMFLOAT3& ca, const XMFLOAT3& ha, const XMFLOAT3& cb, const XMFLOAT3& hb)
+{
+    return fabsf(ca.x - cb.x) <= ha.x + hb.x
+        && fabsf(ca.y - cb.y) <= ha.y + hb.y
+        && fabsf(ca.z - cb.z) <= ha.z + hb.z;
+}
+
+// '#' = wall. Carved labyrinth. Row 0 = entrance; north row opens toward bridge (no extra row under drawbridge).
+const char* const kLines[kRows] = {
+    "#########     #########",
+    "#     #     #   #     #",
+    "# # ### ##### # # # # #",
+    "# # #   #     # # # # #",
+    "# # # ### # ##### # # #",
+    "# #   #   #     # # # #",
+    "# ##### ####### # # # #",
+    "# # #   #     #   # # #",
+    "# # # ####### ##### # #",
+    "# #   #       #     # #",
+    "# ### # ##### # ##### #",
+    "#   #   #     #   # # #",
+    "### ##### ####### # # #",
+    "# # # #     #     #   #",
+    "# # # # ##### ##### ###",
+    "# # #   #     #       #",
+    "# # ##### ########### #",
+    "# #     #           # #",
+    "# ##### ####### ### # #",
+    "# #     #     # #   # #",
+    "# # ##### ### ### #####",
+    "# # #   #   #     #   #",
+    "# # # # # # ####### # #",
+    "# # # # # #         # #",
+    "# # # # ############# #",
+    "# #   #               #",
+    "# ################### #",
+    "# #             #     #",
+    "# # ##### ####### #####",
+    "#       #             #",
+    "#########     #########",
+};
+} // namespace MazeConfig
+
+// Matches Luna Week 7 (Crate): World + TexTransform per object; shader applies gTexTransform to UVs in color.hlsl VS.
 struct RenderItem
 {
     RenderItem() = default;
     XMFLOAT4X4 World = MathHelper::Identity4x4();
+    XMFLOAT4X4 TexTransform = MathHelper::Identity4x4(); // row-major; transpose when copying to ObjectConstants
     int NumFramesDirty = gNumFrameResources;
     UINT ObjCBIndex = -1;
     UINT TexSrvHeapIndex = 0; // texture SRV index in the shader-visible SRV heap
     float Alpha = 1.0f;          // < 1.0 draws with the transparent PSO (water, fountain); shader uses gAlpha
     float WaterSurfaceUv = 0.0f; // copied to GPU cbuffer for layout (must match ObjectConstants / tree shader)
-    XMFLOAT3 BaseColorMul = { 1.0f, 1.0f, 1.0f }; // multiplies texture after sampling (e.g. black moat floor)
+    XMFLOAT3 BaseColorMul = { 1.0f, 1.0f, 1.0f }; // multiplies texture after sampling ( black moat floor)
     MeshGeometry* Geo = nullptr;
     D3D12_PRIMITIVE_TOPOLOGY PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     bool BillboardTree = false;
@@ -64,6 +137,8 @@ private:
 
     void OnKeyboardInput(const GameTimer& gt);
     void UpdateCamera(const GameTimer& gt);
+    void SetupMazeCamera();
+    bool PlayerIntersectsMaze(const XMFLOAT3& eyeWorld) const;
     void UpdateObjectCBs(const GameTimer& gt);
     void UpdateMainPassCB(const GameTimer& gt);
 
@@ -74,6 +149,7 @@ private:
     void BuildRootSignature();
     void BuildShadersAndInputLayout();
     void BuildShapeGeometry();
+    void BuildSkullTxtGeometry();
     void BuildTreeBillboardGeometry();
     void BuildPSOs();
     void BuildFrameResources();
@@ -89,7 +165,7 @@ private:
 
     ComPtr<ID3D12RootSignature> mRootSignature = nullptr;
     ComPtr<ID3D12DescriptorHeap> mCbvHeap = nullptr;
-    // Note: We use a single shader-visible CBV/SRV/UAV heap for both:
+    //  We use a single shader-visible CBV/SRV/UAV heap for both:
     // - CBVs (object + pass)
     // - SRVs (textures)
     UINT mTextureSrvBaseIndex = 0;
@@ -100,7 +176,7 @@ private:
 
     // Texture SRV slots for the shader-visible descriptor heap (t0).
     // We keep slot names aligned with the castle parts we render.
-    static constexpr UINT kNumTextures = 10;
+    static constexpr UINT kNumTextures = 13;
     enum TextureSlot : UINT
     {
         TexStone = 0,        // stone trunk
@@ -113,6 +189,10 @@ private:
         TexGrass = 7,        // ground
         TexWater = 8,        // water
         TexTreeLeaves = 9,   // treearray.dds — billboard trees (treeBillboard.hlsl)
+        // Week 12–style ritual props: copy your Week12 DDS into Textures with these names, or they alias existing files.
+        TexW12Skull = 10,
+        TexW12Bones = 11,
+        TexW12Ritual = 12,
     };
 
     struct TextureData
@@ -137,9 +217,8 @@ private:
     XMFLOAT4X4 mView = MathHelper::Identity4x4();
     XMFLOAT4X4 mProj = MathHelper::Identity4x4();
 
-    float mTheta = 1.5f * XM_PI;
-    float mPhi = 0.2f * XM_PI;
-    float mRadius = 75.0f; // Zoomed out for full castle view
+    Camera mCamera;
+    std::vector<AxisAlignedCollider> mMazeColliders;
 
     POINT mLastMousePos;
 };
@@ -171,6 +250,7 @@ bool ShapesApp::Initialize()
     BuildRootSignature();
     BuildShadersAndInputLayout();
     BuildShapeGeometry();
+    BuildSkullTxtGeometry();
     BuildTreeBillboardGeometry();
     BuildRenderItems();
     BuildFrameResources();
@@ -184,13 +264,15 @@ bool ShapesApp::Initialize()
     ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
     mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
     FlushCommandQueue();
+    SetupMazeCamera();
     return true;
 }
 
 void ShapesApp::OnResize()
 {
     D3DApp::OnResize();
-    XMMATRIX P = XMMatrixPerspectiveFovLH(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
+    mCamera.SetLens(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
+    XMMATRIX P = mCamera.GetProj();
     XMStoreFloat4x4(&mProj, P);
 }
 
@@ -278,47 +360,189 @@ void ShapesApp::Draw(const GameTimer& gt)
     mCommandQueue->Signal(mFence.Get(), mCurrentFence);
 }
 
-void ShapesApp::OnMouseDown(WPARAM btnState, int x, int y) { mLastMousePos.x = x; mLastMousePos.y = y; SetCapture(mhMainWnd); }
-void ShapesApp::OnMouseUp(WPARAM btnState, int x, int y) { ReleaseCapture(); }
-void ShapesApp::OnMouseMove(WPARAM btnState, int x, int y) {
-    if ((btnState & MK_LBUTTON) != 0) {
+void ShapesApp::OnMouseDown(WPARAM btnState, int x, int y)
+{
+    mLastMousePos.x = x;
+    mLastMousePos.y = y;
+    SetCapture(mhMainWnd);
+}
+void ShapesApp::OnMouseUp(WPARAM btnState, int x, int y)
+{
+    if ((btnState & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) == 0)
+        ReleaseCapture();
+}
+void ShapesApp::OnMouseMove(WPARAM btnState, int x, int y)
+{
+    if (((btnState & MK_LBUTTON) != 0) || ((btnState & MK_RBUTTON) != 0)) {
         float dx = XMConvertToRadians(0.25f * static_cast<float>(x - mLastMousePos.x));
         float dy = XMConvertToRadians(0.25f * static_cast<float>(y - mLastMousePos.y));
-        mTheta += dx; mPhi += dy;
-        mPhi = MathHelper::Clamp(mPhi, 0.1f, MathHelper::Pi - 0.1f);
+        mCamera.Pitch(dy);
+        mCamera.RotateY(dx);
+        mCamera.UpdateViewMatrix();
     }
-    else if ((btnState & MK_RBUTTON) != 0) {
-        float dx = 0.05f * static_cast<float>(x - mLastMousePos.x);
-        float dy = 0.05f * static_cast<float>(y - mLastMousePos.y);
-        mRadius += dx - dy;
-        mRadius = MathHelper::Clamp(mRadius, 5.0f, 150.0f);
-    }
-    mLastMousePos.x = x; mLastMousePos.y = y;
+    mLastMousePos.x = x;
+    mLastMousePos.y = y;
 }
 
-void ShapesApp::OnKeyboardInput(const GameTimer& gt) { mIsWireframe = (GetAsyncKeyState('1') & 0x8000); }
+void ShapesApp::OnKeyboardInput(const GameTimer& gt)
+{
+    mIsWireframe = (GetAsyncKeyState('1') & 0x8000);
 
-void ShapesApp::UpdateCamera(const GameTimer& gt) {
-    mEyePos.x = mRadius * sinf(mPhi) * cosf(mTheta);
-    mEyePos.z = mRadius * sinf(mPhi) * sinf(mTheta);
-    mEyePos.y = mRadius * cosf(mPhi);
-    XMVECTOR pos = XMVectorSet(mEyePos.x, mEyePos.y, mEyePos.z, 1.0f);
-    XMVECTOR target = XMVectorZero();
+    const float dt = gt.DeltaTime();
+    const float walkSpeed = 10.0f;
+    const float flySpeed = 22.0f;
+    XMFLOAT3 pos = mCamera.GetPosition3f();
+
+    const bool freeFly = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    const float moveSpeed = freeFly ? flySpeed : walkSpeed;
+
+    XMVECTOR forward = XMVectorZero();
+    XMVECTOR right = XMVectorZero();
     XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-    XMMATRIX view = XMMatrixLookAtLH(pos, target, up);
-    XMStoreFloat4x4(&mView, view);
+
+    if (freeFly) {
+        forward = mCamera.GetLook();
+        float fl = XMVectorGetX(XMVector3Length(forward));
+        if (fl > 1e-4f)
+            forward = XMVectorScale(forward, 1.0f / fl);
+        right = mCamera.GetRight();
+        float rl = XMVectorGetX(XMVector3Length(right));
+        if (rl > 1e-4f)
+            right = XMVectorScale(right, 1.0f / rl);
+        up = mCamera.GetUp();
+        float ul = XMVectorGetX(XMVector3Length(up));
+        if (ul > 1e-4f)
+            up = XMVectorScale(up, 1.0f / ul);
+    }
+    else {
+        forward = mCamera.GetLook();
+        forward = XMVectorSet(XMVectorGetX(forward), 0.0f, XMVectorGetZ(forward), 0.0f);
+        float flen = XMVectorGetX(XMVector3Length(forward));
+        if (flen > 1e-4f)
+            forward = XMVectorScale(forward, 1.0f / flen);
+
+        right = mCamera.GetRight();
+        right = XMVectorSet(XMVectorGetX(right), 0.0f, XMVectorGetZ(right), 0.0f);
+        float rlen = XMVectorGetX(XMVector3Length(right));
+        if (rlen > 1e-4f)
+            right = XMVectorScale(right, 1.0f / rlen);
+    }
+
+    XMVECTOR move = XMVectorZero();
+    if (GetAsyncKeyState('W') & 0x8000)
+        move = XMVectorAdd(move, XMVectorScale(forward, moveSpeed * dt));
+    if (GetAsyncKeyState('S') & 0x8000)
+        move = XMVectorAdd(move, XMVectorScale(forward, -moveSpeed * dt));
+    if (GetAsyncKeyState('A') & 0x8000)
+        move = XMVectorAdd(move, XMVectorScale(right, -moveSpeed * dt));
+    if (GetAsyncKeyState('D') & 0x8000)
+        move = XMVectorAdd(move, XMVectorScale(right, moveSpeed * dt));
+    if (GetAsyncKeyState(VK_UP) & 0x8000)
+        move = XMVectorAdd(move, XMVectorScale(forward, moveSpeed * dt));
+    if (GetAsyncKeyState(VK_DOWN) & 0x8000)
+        move = XMVectorAdd(move, XMVectorScale(forward, -moveSpeed * dt));
+    if (GetAsyncKeyState(VK_LEFT) & 0x8000)
+        move = XMVectorAdd(move, XMVectorScale(right, -moveSpeed * dt));
+    if (GetAsyncKeyState(VK_RIGHT) & 0x8000)
+        move = XMVectorAdd(move, XMVectorScale(right, moveSpeed * dt));
+    if (freeFly) {
+        if ((GetAsyncKeyState(VK_SPACE) & 0x8000) || (GetAsyncKeyState('E') & 0x8000))
+            move = XMVectorAdd(move, XMVectorScale(up, moveSpeed * dt));
+        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState('Q') & 0x8000))
+            move = XMVectorAdd(move, XMVectorScale(up, -moveSpeed * dt));
+    }
+
+    XMFLOAT3 delta;
+    XMStoreFloat3(&delta, move);
+
+    if (freeFly) {
+        pos.x += delta.x;
+        pos.y += delta.y;
+        pos.z += delta.z;
+    }
+    else {
+        const float nx = pos.x + delta.x;
+        const float nz = pos.z + delta.z;
+
+        XMFLOAT3 tryFull(nx, pos.y, nz);
+        if (!PlayerIntersectsMaze(tryFull)) {
+            pos.x = nx;
+            pos.z = nz;
+        }
+        else {
+            XMFLOAT3 tryX(nx, pos.y, pos.z);
+            if (!PlayerIntersectsMaze(tryX))
+                pos.x = nx;
+            XMFLOAT3 tryZ(pos.x, pos.y, nz);
+            if (!PlayerIntersectsMaze(tryZ))
+                pos.z = nz;
+        }
+    }
+
+    mCamera.SetPosition(pos.x, pos.y, pos.z);
+    mCamera.UpdateViewMatrix();
 }
 
-void ShapesApp::UpdateObjectCBs(const GameTimer& gt) {
+void ShapesApp::UpdateCamera(const GameTimer& gt)
+{
+    mCamera.UpdateViewMatrix();
+    mEyePos = mCamera.GetPosition3f();
+    XMMATRIX view = mCamera.GetView();
+    XMMATRIX proj = mCamera.GetProj();
+    XMStoreFloat4x4(&mView, view);
+    XMStoreFloat4x4(&mProj, proj);
+}
+
+void ShapesApp::SetupMazeCamera()
+{
+    using namespace MazeConfig;
+    int entranceCol = kCols / 2;
+    for (int c = 0; c < kCols; ++c) {
+        if (kLines[0][c] == ' ') {
+            entranceCol = c;
+            break;
+        }
+    }
+    const float cellCenterX = kOriginX + (entranceCol + 0.5f) * kCell;
+    const float southEdgeZ = kOriginZ + 0.5f * kCell;
+    const float camZ = kOriginZ - 1.35f * kCell;
+    const XMFLOAT3 eyePos(cellCenterX, kEyeHeight, camZ);
+    const XMFLOAT3 target(cellCenterX, kEyeHeight * 0.55f, southEdgeZ + kCell * 0.75f);
+    mCamera.LookAt(eyePos, target, XMFLOAT3(0.0f, 1.0f, 0.0f));
+    mCamera.UpdateViewMatrix();
+}
+
+bool ShapesApp::PlayerIntersectsMaze(const XMFLOAT3& eyeWorld) const
+{
+    using namespace MazeConfig;
+    const XMFLOAT3 pCen(eyeWorld.x, kPlayerBodyCenterY, eyeWorld.z);
+    // XZ footprint must use kPlayerHalfXZ on both horizontal axes (was wrongly kPlayerHalfY on Z).
+    const XMFLOAT3 pHalf(kPlayerHalfXZ, kPlayerHalfY, kPlayerHalfXZ);
+    for (const auto& w : mMazeColliders) {
+        if (AabbOverlap(pCen, pHalf, w.Center, w.HalfExtents))
+            return true;
+    }
+    return false;
+}
+
+void ShapesApp::UpdateObjectCBs(const GameTimer& gt)
+{
+    // Luna Week 7: upload World and TexTransform (row-major in C++; transpose for HLSL column-major cbuffers).
     auto currObjectCB = mCurrFrameResource->ObjectCB.get();
-    for (auto& e : mAllRitems) {
-        if (e->NumFramesDirty > 0) {
+    for (auto& e : mAllRitems)
+    {
+        if (e->NumFramesDirty > 0)
+        {
             XMMATRIX world = XMLoadFloat4x4(&e->World);
-            ObjectConstants objConstants;
+            XMMATRIX texTransform = XMLoadFloat4x4(&e->TexTransform);
+
+            ObjectConstants objConstants{};
             XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
+            XMStoreFloat4x4(&objConstants.TexTransform, XMMatrixTranspose(texTransform));
             objConstants.Alpha = e->Alpha;
             objConstants.BaseColorMul = e->BaseColorMul;
             objConstants.WaterSurfaceUv = e->WaterSurfaceUv;
+
             currObjectCB->CopyData(e->ObjCBIndex, objConstants);
             e->NumFramesDirty--;
         }
@@ -341,7 +565,7 @@ void ShapesApp::UpdateMainPassCB(const GameTimer& gt) {
     // Pass constants feed color.hlsl and treeBillboard.hlsl (gAmbientLight, gLights, gTotalTime).
     mMainPassCB.AmbientLight = XMFLOAT4(0.25f, 0.25f, 0.25f, 1.0f);
 
-    // Clear the light array, then fill only the slots we use.
+    
     for (int i = 0; i < MaxLights; ++i) {
         mMainPassCB.Lights[i].Strength = XMFLOAT3(0.0f, 0.0f, 0.0f);
         mMainPassCB.Lights[i].FalloffStart = 0.0f;
@@ -370,6 +594,15 @@ void ShapesApp::UpdateMainPassCB(const GameTimer& gt) {
         L.FalloffEnd = 120.0f;
     }
 
+    // Lights[4]: point light over the inner courtyard (center of castle yard). Tweak Y and Strength for your look.
+    {
+        auto& L = mMainPassCB.Lights[4];
+        L.Strength = XMFLOAT3(0.55f, 0.48f, 0.35f);
+        L.Position = XMFLOAT3(0.0f, 12.0f, 0.0f);
+        L.FalloffStart = 4.0f;
+        L.FalloffEnd = 55.0f;
+    }
+
     auto currPassCB = mCurrFrameResource->PassCB.get();
     currPassCB->CopyData(0, mMainPassCB);
 }
@@ -395,7 +628,7 @@ static std::wstring GetTextureAbsPath(const wchar_t* filename, const wchar_t* te
     size_t pos = exeStr.find_last_of(L"\\/");
     std::wstring exeDir = (pos == std::wstring::npos) ? L"" : exeStr.substr(0, pos + 1);
 
-    // Try multiple relative locations because students often run from different
+    // Try multiple relative locations 
     // output folders (x64\\Debug, x64\\DebugFoo, etc.). This keeps texture loading stable.
     const wchar_t* candidates[] = {
         texturesFolderRelativeToExe, // default
@@ -430,7 +663,11 @@ void ShapesApp::LoadTextures() {
         { TexWoodBridge, L"WoodCrate02.dds" },
         { TexGrass, L"grass.dds" },
         { TexWater, L"water1.dds" },
-        { TexTreeLeaves, L"treearray.dds" }
+        { TexTreeLeaves, L"treearray.dds" },
+        // Week 12 ritual pack: drop your DDS into Textures as these names, or they alias existing art until then.
+        { TexW12Skull, L"skull_crossbones_DXT5.dds" },
+        { TexW12Bones, L"skull_crossbones_DXT5.dds" },
+        { TexW12Ritual, L"bricks2.dds" },
     };
 
     for (const auto& e : entries) {
@@ -561,8 +798,7 @@ void ShapesApp::BuildShadersAndInputLayout() {
 void ShapesApp::BuildShapeGeometry()
 {
     GeometryGenerator geoGen;
-    // We use multiple copies of the same primitive mesh so we can assign different
-    // "materials" using only per-vertex colors (this A1 version has no textures yet).
+    // Shared primitive meshes; each RenderItem picks a texture via TexSrvHeapIndex.
     GeometryGenerator::MeshData stoneBox = geoGen.CreateBox(1.0f, 1.0f, 1.0f, 3);
     GeometryGenerator::MeshData woodBox = geoGen.CreateBox(1.0f, 1.0f, 1.0f, 3);
     GeometryGenerator::MeshData grid = geoGen.CreateGrid(30.0f, 30.0f, 60, 40);
@@ -574,7 +810,7 @@ void ShapesApp::BuildShapeGeometry()
     GeometryGenerator::MeshData cylinderTrunk = geoGen.CreateCylinder(0.5f, 0.5f, 3.0f, 24, 10);
     GeometryGenerator::MeshData pyramid = geoGen.CreatePyramid(1.0f, 1.0f, 1.0f);
 
-    // 4 additional shapes for the assignment demo.
+    // Extra primitives for walls and props.
     GeometryGenerator::MeshData wedge = geoGen.CreateWedge(1.0f, 1.0f, 1.0f);
     GeometryGenerator::MeshData cone = geoGen.CreateCone(0.5f, 1.5f, 20);
     GeometryGenerator::MeshData triPrism = geoGen.CreateTriangularPrism(1.0f, 1.0f, 1.0f);
@@ -715,9 +951,13 @@ void ShapesApp::BuildShapeGeometry()
     CopyMemory(geo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vertices.size() * sizeof(Vertex));
     ThrowIfFailed(D3DCreateBlob(indices.size() * sizeof(std::uint16_t), &geo->IndexBufferCPU));
     CopyMemory(geo->IndexBufferCPU->GetBufferPointer(), indices.data(), indices.size() * sizeof(std::uint16_t));
+    // Vertex TexC is [0,1] on the grid; tiling for grass etc. comes from RenderItem::TexTransform → cbPerObject (Luna Week 7).
     geo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(), mCommandList.Get(), vertices.data(), vertices.size() * sizeof(Vertex), geo->VertexBufferUploader);
     geo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(), mCommandList.Get(), indices.data(), indices.size() * sizeof(std::uint16_t), geo->IndexBufferUploader);
-    geo->VertexByteStride = sizeof(Vertex); geo->VertexBufferByteSize = vertices.size() * sizeof(Vertex); geo->IndexFormat = DXGI_FORMAT_R16_UINT; geo->IndexBufferByteSize = indices.size() * sizeof(std::uint16_t);
+    geo->VertexByteStride = sizeof(Vertex);
+    geo->VertexBufferByteSize = static_cast<UINT>(vertices.size() * sizeof(Vertex));
+    geo->IndexFormat = DXGI_FORMAT_R16_UINT;
+    geo->IndexBufferByteSize = static_cast<UINT>(indices.size() * sizeof(std::uint16_t));
 
     geo->DrawArgs["stoneBox"] = stoneBoxSubmesh;
     geo->DrawArgs["woodBox"] = woodBoxSubmesh;
@@ -736,16 +976,41 @@ void ShapesApp::BuildShapeGeometry()
     mGeometries[geo->Name] = std::move(geo);
 }
 
+void ShapesApp::BuildSkullTxtGeometry()
+{
+    wchar_t modulePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    std::wstring exeDir(modulePath);
+    const size_t slash = exeDir.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        exeDir.resize(slash + 1);
+
+    const std::wstring candidates[] = {
+        exeDir + L"Models\\skull.txt",
+        L"Models\\skull.txt",
+        L"..\\..\\Models\\skull.txt",
+        L"e:\\HOOMAN\\DirectX-master\\Week12\\Picking\\Models\\skull.txt",
+    };
+
+    for (const auto& path : candidates) {
+        std::unique_ptr<MeshGeometry> geo;
+        if (::BuildSkullTxtGeometry(md3dDevice.Get(), mCommandList.Get(), path, geo)) {
+            mGeometries["skullGeo"] = std::move(geo);
+            return;
+        }
+    }
+}
+
 void ShapesApp::BuildTreeBillboardGeometry()
 {
     // Each vertex is one tree root. TexC.xy = half width and half height in world units (read in treeBillboard VS/GS).
-    const int numTrees = 12;
+    const int numTrees = kBillboardTreeCount;
     std::vector<Vertex> vertices(numTrees);
     std::vector<std::uint16_t> indices(numTrees);
     for (int i = 0; i < numTrees; ++i) {
         vertices[i].Pos = { 0.0f, 0.0f, 0.0f };
         vertices[i].Normal = { 0.0f, 0.0f, 0.0f };
-        vertices[i].TexC = { 5.12f, 6.4f };
+        vertices[i].TexC = { kTreeBillboardHalfW, kTreeBillboardHalfH };
         indices[i] = (std::uint16_t)i;
     }
 
@@ -758,9 +1023,9 @@ void ShapesApp::BuildTreeBillboardGeometry()
     geo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(), mCommandList.Get(), vertices.data(), vertices.size() * sizeof(Vertex), geo->VertexBufferUploader);
     geo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(), mCommandList.Get(), indices.data(), indices.size() * sizeof(std::uint16_t), geo->IndexBufferUploader);
     geo->VertexByteStride = sizeof(Vertex);
-    geo->VertexBufferByteSize = vertices.size() * sizeof(Vertex);
+    geo->VertexBufferByteSize = static_cast<UINT>(vertices.size() * sizeof(Vertex));
     geo->IndexFormat = DXGI_FORMAT_R16_UINT;
-    geo->IndexBufferByteSize = indices.size() * sizeof(std::uint16_t);
+    geo->IndexBufferByteSize = static_cast<UINT>(indices.size() * sizeof(std::uint16_t));
 
     SubmeshGeometry onePoint;
     onePoint.IndexCount = 1;
@@ -867,19 +1132,33 @@ void ShapesApp::BuildRenderItems()
     // 1. SANDWICH GROUND LAYOUT
     // - center yard grass
     // - black trench + water in the moat region (handled below)
-    // - outer grass around the moat for the tree ring
-    const float outerBound = 38.0f; // outer edge of grass ring (trees sit around ~34)
+    // - outer grass around the moat; island edge (outerBound) meets ocean — trees sit just inside that edge.
+    const float outerBound = 58.0f; // outer edge of grass (island + margin past maze approach)
     const float yardHalf = moatInner - 0.75f; // leave a small gap so no grass lies under the moat cutout
     const float moatEdgeMid = 0.5f * (moatOuter + outerBound);
     const float outerStripHalfZ = moatEdgeMid;
     const float outerStripHalfX = moatEdgeMid;
 
-    auto makeGroundTile = [&](float sx, float sz, float x, float z)
+    // Grass: fewer UV repeats + strong V-stretch = long blade look; wild tint for color.hlsl grass path.
+    const float refGrassScale = (2.0f * yardHalf) / waterBaseSize;
+    const float kGrassRepeatsRef = 7.25f;
+    const float kGrassUvStretchU = 0.62f;
+    const float kGrassUvStretchV = 1.62f;
+
+    auto addGrassTile = [&](float sx, float sz, float x, float z, float yElev)
     {
         auto r = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&r->World,
             XMMatrixScaling(sx, 1.0f, sz) *
-            XMMatrixTranslation(x, 0.0f, z));
+            XMMatrixTranslation(x, yElev, z));
+        const float baseU = kGrassRepeatsRef * (sx / refGrassScale);
+        const float baseV = kGrassRepeatsRef * (sz / refGrassScale);
+        const float tu = baseU * kGrassUvStretchU;
+        const float tv = baseV * kGrassUvStretchV;
+        XMMATRIX grassTex = XMMatrixScaling(tu, tv, 1.0f);
+        XMStoreFloat4x4(&r->TexTransform, grassTex);
+        r->BaseColorMul = XMFLOAT3(0.52f, 1.32f, 0.42f);
+
         r->ObjCBIndex = objCBIndex++;
         r->Geo = mGeometries["shapeGeo"].get();
         r->IndexCount = r->Geo->DrawArgs["waterGrid"].IndexCount;
@@ -887,6 +1166,10 @@ void ShapesApp::BuildRenderItems()
         r->BaseVertexLocation = r->Geo->DrawArgs["waterGrid"].BaseVertexLocation;
         r->TexSrvHeapIndex = TexGrass;
         mAllRitems.push_back(std::move(r));
+    };
+    auto makeGroundTile = [&](float sx, float sz, float x, float z)
+    {
+        addGrassTile(sx, sz, x, z, 0.0f);
     };
 
     // Center yard grass square
@@ -910,6 +1193,28 @@ void ShapesApp::BuildRenderItems()
     makeGroundTile((outerBound - moatOuter) / waterBaseSize, (outerBound - moatOuter) / waterBaseSize, +moatEdgeMid, -moatEdgeMid);
     makeGroundTile((outerBound - moatOuter) / waterBaseSize, (outerBound - moatOuter) / waterBaseSize, -moatEdgeMid, +moatEdgeMid);
     makeGroundTile((outerBound - moatOuter) / waterBaseSize, (outerBound - moatOuter) / waterBaseSize, -moatEdgeMid, -moatEdgeMid);
+
+    // Grass strip south of the maze entrance (extends the green line toward the player past the maze mouth).
+    {
+        using namespace MazeConfig;
+        const float mazeHalfW = 0.5f * kCols * kCell;
+        const float southPad = 28.0f;
+        const float stripZ = southPad / waterBaseSize;
+        const float stripX = (2.0f * mazeHalfW + 16.0f) / waterBaseSize;
+        const float southZ = kOriginZ - 0.5f * southPad - 0.35f * kCell;
+        makeGroundTile(stripX, stripZ, 0.0f, southZ);
+    }
+
+    // Continuous grass across the entire maze (slightly above Y=0 to limit z-fighting with the yard tiles).
+    {
+        using namespace MazeConfig;
+        const float pad = 4.0f;
+        const float gw = (kCols * kCell + pad) / waterBaseSize;
+        const float gd = (kRows * kCell + pad) / waterBaseSize;
+        const float cx = kOriginX + 0.5f * kCols * kCell;
+        const float cz = kOriginZ + 0.5f * kRows * kCell;
+        addGrassTile(gw, gd, cx, cz, 0.018f);
+    }
 
     // Trench geometry: opaque side walls + bottom floor.
     // Water surface sits inside the trench.
@@ -980,7 +1285,7 @@ void ShapesApp::BuildRenderItems()
 
     // Outer ocean: oceanInnerEdge matches outerBound so grass meets water with no gap.
     const float oceanInnerEdge = outerBound;
-    const float oceanOuterEdge = 95.0f;
+    const float oceanOuterEdge = 128.0f; // widened with island so open water still reads clearly beyond the trees
     const float oceanMid = 0.5f * (oceanInnerEdge + oceanOuterEdge);
     const float oceanThickness = oceanOuterEdge - oceanInnerEdge;
     const float stripScaleXO = (2.0f * oceanOuterEdge) / waterBaseSize;
@@ -995,6 +1300,319 @@ void ShapesApp::BuildRenderItems()
     makeWater(cornerScaleO, cornerScaleO, +oceanMid, -oceanMid);
     makeWater(cornerScaleO, cornerScaleO, -oceanMid, +oceanMid);
     makeWater(cornerScaleO, cornerScaleO, -oceanMid, -oceanMid);
+
+    // Pool at the maze south approach (main “maze entrance” water; moat/ocean remain for the island).
+    {
+        using namespace MazeConfig;
+        const float mazeHalfW = 0.5f * kCols * kCell;
+        const float southPad = 28.0f;
+        const float poolW = (2.0f * mazeHalfW + 14.0f) / waterBaseSize;
+        const float poolD = 20.0f / waterBaseSize;
+        const float poolZ = kOriginZ - 0.5f * southPad - 0.25f * kCell;
+        makeWater(poolW, poolD, 0.0f, poolZ);
+        makeMoatFloor(poolW, poolD, 0.0f, poolZ);
+    }
+
+    // Maze (brick walls + axis-aligned colliders for first-person walking).
+    {
+        using namespace MazeConfig;
+        mMazeColliders.clear();
+        const float sx = kCell * kWallScaleZ;
+        const float sz = kCell * kWallScaleZ;
+        const float sy = kWallHeight;
+        for (int r = 0; r < kRows; ++r) {
+            for (int c = 0; c < kCols; ++c) {
+                if (kLines[r][c] != '#')
+                    continue;
+                const float wx = kOriginX + (c + 0.5f) * kCell;
+                const float wz = kOriginZ + (r + 0.5f) * kCell;
+                const float wy = 0.5f * kWallHeight;
+
+                AxisAlignedCollider box;
+                box.Center = XMFLOAT3(wx, wy, wz);
+                box.HalfExtents = XMFLOAT3(0.5f * sx, 0.5f * sy, 0.5f * sz);
+                mMazeColliders.push_back(box);
+
+                auto wall = std::make_unique<RenderItem>();
+                XMStoreFloat4x4(&wall->World,
+                    XMMatrixScaling(sx, sy, sz) * XMMatrixTranslation(wx, wy, wz));
+                wall->ObjCBIndex = objCBIndex++;
+                wall->Geo = mGeometries["shapeGeo"].get();
+                wall->IndexCount = wall->Geo->DrawArgs["stoneBox"].IndexCount;
+                wall->StartIndexLocation = wall->Geo->DrawArgs["stoneBox"].StartIndexLocation;
+                wall->BaseVertexLocation = wall->Geo->DrawArgs["stoneBox"].BaseVertexLocation;
+                wall->TexSrvHeapIndex = TexBrickBase;
+                mAllRitems.push_back(std::move(wall));
+            }
+        }
+
+        // Maze dressing: Week 7-style TexTransform/BaseColorMul on select props; optional yaw + colliders.
+        auto addMazeProp = [&](float cx, float cz, float yBottom, float sx, float sy, float sz,
+            const char* meshName, UINT texSlot, bool addCollider, float yaw = 0.f,
+            const XMFLOAT3* pMul = nullptr, const XMMATRIX* pTex = nullptr)
+        {
+            const float cy = yBottom + 0.5f * sy;
+            auto p = std::make_unique<RenderItem>();
+            XMMATRIX world = XMMatrixScaling(sx, sy, sz) * XMMatrixRotationY(yaw) * XMMatrixTranslation(cx, cy, cz);
+            XMStoreFloat4x4(&p->World, world);
+            if (pMul)
+                p->BaseColorMul = *pMul;
+            if (pTex)
+                XMStoreFloat4x4(&p->TexTransform, *pTex);
+            p->ObjCBIndex = objCBIndex++;
+            p->Geo = mGeometries["shapeGeo"].get();
+            const auto& sm = p->Geo->DrawArgs[meshName];
+            p->IndexCount = sm.IndexCount;
+            p->StartIndexLocation = sm.StartIndexLocation;
+            p->BaseVertexLocation = sm.BaseVertexLocation;
+            p->TexSrvHeapIndex = texSlot;
+            if (addCollider) {
+                AxisAlignedCollider b;
+                b.Center = XMFLOAT3(cx, cy, cz);
+                b.HalfExtents = XMFLOAT3(0.5f * sx, 0.5f * sy, 0.5f * sz);
+                mMazeColliders.push_back(b);
+            }
+            mAllRitems.push_back(std::move(p));
+        };
+
+        auto addSkullMeshPropNS = [&](float cx, float cz, float yBottom, float sx, float sy, float sz, float yawRad, bool addCollider)
+        {
+            auto it = mGeometries.find("skullGeo");
+            if (it == mGeometries.end() || !it->second)
+                return;
+            auto p = std::make_unique<RenderItem>();
+            XMMATRIX world = XMMatrixScaling(sx, sy, sz) * XMMatrixRotationY(yawRad) * XMMatrixTranslation(cx, yBottom, cz);
+            XMStoreFloat4x4(&p->World, world);
+            p->BaseColorMul = XMFLOAT3(0.9f, 0.88f, 0.84f);
+            p->ObjCBIndex = objCBIndex++;
+            p->Geo = it->second.get();
+            const auto& sm = p->Geo->DrawArgs["skull"];
+            p->IndexCount = sm.IndexCount;
+            p->StartIndexLocation = sm.StartIndexLocation;
+            p->BaseVertexLocation = sm.BaseVertexLocation;
+            p->TexSrvHeapIndex = TexW12Skull;
+            if (addCollider) {
+                const float hx = 0.24f * sx;
+                const float hy = 0.24f * sy;
+                const float hz = 0.24f * sz;
+                AxisAlignedCollider b;
+                b.Center = XMFLOAT3(cx, yBottom + hy, cz);
+                b.HalfExtents = XMFLOAT3(hx, hy, hz);
+                mMazeColliders.push_back(b);
+            }
+            mAllRitems.push_back(std::move(p));
+        };
+
+        auto addSkullMeshProp = [&](float cx, float cz, float yBottom, float uniformScale, float yawRad, bool addCollider)
+        {
+            addSkullMeshPropNS(cx, cz, yBottom, uniformScale, uniformScale, uniformScale, yawRad, addCollider);
+        };
+
+        auto cellXZ = [&](int row, int col) -> XMFLOAT2
+        {
+            return XMFLOAT2(kOriginX + (col + 0.5f) * kCell, kOriginZ + (row + 0.5f) * kCell);
+        };
+
+        auto addPodium = [&](float cx, float cz)
+        {
+            // Wider, taller cylinder; slim skull (non-uniform scale) on top.
+            addMazeProp(cx, cz, 0.0f, 0.82f, 0.58f, 0.82f, "cylinderTrunk", TexStoneNeck, true, 0.f, nullptr, nullptr);
+            if (mGeometries.find("skullGeo") != mGeometries.end() && mGeometries["skullGeo"])
+                addSkullMeshPropNS(cx, cz, 0.58f, 0.095f, 0.155f, 0.088f, 0.f, false);
+            else
+                addMazeProp(cx, cz, 0.58f, 0.48f, 0.34f, 0.44f, "stoneBox", TexW12Skull, true, 0.f, nullptr, nullptr);
+        };
+
+        // Stone spikes in open corridors with skull trophies (cone + mesh or fallback box).
+        auto addSpikeTrophy = [&](float cx, float cz, float yawRad)
+        {
+            const float spH = 1.48f;
+            const float spR = 0.14f;
+            addMazeProp(cx, cz, 0.0f, spR, spH, spR, "cone", TexBrickBase, true, yawRad);
+            if (mGeometries.find("skullGeo") != mGeometries.end() && mGeometries["skullGeo"])
+                addSkullMeshPropNS(cx, cz, spH, 0.092f, 0.14f, 0.085f, yawRad + 0.35f, false);
+            else
+                addMazeProp(cx, cz, spH, 0.26f, 0.28f, 0.24f, "stoneBox", TexW12Skull, false, yawRad);
+        };
+
+        // Skull / crossbones texture on thin wall slabs (2D “drawings” along corridors).
+        {
+            XMFLOAT2 q = cellXZ(12, 11);
+            addMazeProp(q.x - 0.82f, q.y, 1.1f, 0.06f, 0.95f, 0.68f, "stoneBox", TexW12Skull, false, 0.0f);
+            addMazeProp(q.x + 0.82f, q.y, 1.1f, 0.06f, 0.95f, 0.68f, "stoneBox", TexW12Skull, false, 3.14159265f);
+            q = cellXZ(16, 11);
+            addMazeProp(q.x, q.y - 0.82f, 1.2f, 0.65f, 1.0f, 0.06f, "stoneBox", TexW12Skull, false, 1.57079633f);
+            q = cellXZ(10, 15);
+            addMazeProp(q.x + 0.78f, q.y, 0.95f, 0.06f, 0.85f, 0.6f, "stoneBox", TexW12Bones, false, 0.0f);
+        }
+
+        // Extra 3D skull on the path when skull.txt loaded (Week12 mesh).
+        {
+            XMFLOAT2 q = cellXZ(8, 9);
+            addSkullMeshProp(q.x + 0.15f, q.y, 0.0f, 0.19f, -0.85f, true);
+        }
+
+        // Skull plaques + relics (row indices offset for +8 south extension rows).
+        {
+            XMFLOAT2 q = cellXZ(10, 11);
+            addMazeProp(q.x + 0.7f, q.y, 0.0f, 0.55f, 0.4f, 0.32f, "stoneBox", TexW12Skull, true);
+        }
+        {
+            XMFLOAT2 q = cellXZ(13, 7);
+            addMazeProp(q.x - 0.5f, q.y + 0.4f, 0.0f, 0.5f, 0.35f, 0.5f, "stoneBox", TexW12Skull, true);
+        }
+        {
+            XMFLOAT2 q = cellXZ(16, 15);
+            addMazeProp(q.x, q.y, 0.0f, 0.65f, 0.55f, 0.65f, "pyramid", TexStone, true);
+        }
+        {
+            XMFLOAT2 q = cellXZ(18, 10);
+            addMazeProp(q.x + 0.45f, q.y - 0.45f, 0.0f, 0.9f, 0.35f, 0.55f, "wedge", TexBrickBase, true);
+        }
+        {
+            XMFLOAT2 q = cellXZ(20, 5);
+            addMazeProp(q.x, q.y, 0.0f, 0.35f, 0.95f, 0.35f, "cone", TexWood, true);
+        }
+        {
+            XMFLOAT2 q = cellXZ(14, 4);
+            addMazeProp(q.x, q.y, 0.0f, 0.32f, 0.45f, 0.32f, "cylinderTrunk", TexStoneNeck, true);
+            addMazeProp(q.x, q.y, 0.45f, 0.5f, 0.22f, 0.42f, "stoneBox", TexW12Skull, true);
+        }
+        {
+            XMFLOAT2 q = cellXZ(22, 12);
+            addMazeProp(q.x - 0.55f, q.y, 0.0f, 0.45f, 0.5f, 0.45f, "triPrism", TexStoneNeck, true);
+        }
+        {
+            XMFLOAT2 q = cellXZ(20, 11);
+            addMazeProp(q.x + 0.5f, q.y, 0.0f, 0.55f, 0.28f, 0.4f, "stoneBox", TexW12Skull, true);
+        }
+        {
+            XMFLOAT2 q = cellXZ(17, 17);
+            addMazeProp(q.x, q.y, 0.0f, 0.5f, 0.15f, 0.85f, "stoneBox", TexBrickTop, false);
+        }
+        {
+            XMFLOAT2 q = cellXZ(19, 3);
+            static const XMFLOAT3 boneMul(0.95f, 0.72f, 0.52f);
+            addMazeProp(q.x, q.y, 0.0f, 0.85f, 0.25f, 0.35f, "diamond", TexW12Bones, false, 0.4f, &boneMul, nullptr);
+        }
+        {
+            XMFLOAT2 q = cellXZ(18, 10);
+            addMazeProp(q.x, q.y, 0.0f, 0.4f, 0.4f, 0.4f, "pyramid", TexBrickTop, true);
+        }
+
+        // Bone pile (tinted bones texture).
+        {
+            XMFLOAT2 q = cellXZ(11, 6);
+            static const XMFLOAT3 boneMul(0.92f, 0.68f, 0.48f);
+            addMazeProp(q.x + 0.3f, q.y, 0.0f, 0.75f, 0.22f, 0.5f, "wedge", TexW12Bones, true, -0.5f, &boneMul, nullptr);
+        }
+
+        // Ritual “drawings” on the ground (flat diamonds, dark tint + UV scale).
+        {
+            XMMATRIX ritTex = XMMatrixScaling(2.8f, 2.8f, 1.0f);
+            static const XMFLOAT3 ritMul(0.42f, 0.14f, 0.14f);
+            XMFLOAT2 q = cellXZ(12, 8);
+            addMazeProp(q.x, q.y, 0.02f, 1.15f, 0.04f, 1.15f, "diamond", TexW12Ritual, false, 0.7f, &ritMul, &ritTex);
+            q = cellXZ(20, 14);
+            addMazeProp(q.x, q.y, 0.02f, 1.0f, 0.04f, 1.0f, "diamond", TexW12Ritual, false, -0.9f, &ritMul, &ritTex);
+            q = cellXZ(8, 14);
+            addMazeProp(q.x, q.y, 0.02f, 0.9f, 0.04f, 0.9f, "diamond", TexW12Ritual, false, 1.2f, &ritMul, &ritTex);
+        }
+
+        // Podiums with slim skulls on larger bases.
+        addPodium(cellXZ(15, 9).x, cellXZ(15, 9).y);
+        addPodium(cellXZ(18, 6).x, cellXZ(18, 6).y);
+        addPodium(cellXZ(21, 13).x, cellXZ(21, 13).y);
+
+        // Spikes with trophy skulls (maze interior — fewer; more in courtyard toward moat).
+        addSpikeTrophy(cellXZ(14, 10).x + 0.2f, cellXZ(14, 10).y - 0.15f, 0.9f);
+        addSpikeTrophy(cellXZ(18, 12).x - 0.25f, cellXZ(18, 12).y + 0.1f, -0.4f);
+        addSpikeTrophy(cellXZ(11, 13).x - 0.2f, cellXZ(11, 13).y + 0.25f, 2.5f);
+        addSpikeTrophy(cellXZ(22, 10).x + 0.1f, cellXZ(22, 10).y, 0.65f);
+
+        // Dead tree: gnarled trunk + crown + skulls on short “chains” (wood strips).
+        {
+            XMFLOAT2 base = cellXZ(15, 12);
+            float bx = base.x;
+            float bz = base.y;
+            const float th = 3.85f;
+            addMazeProp(bx, bz, 0.0f, 0.42f, th, 0.42f, "cylinderTrunk", TexWood, true);
+            addMazeProp(bx, bz, th, 0.65f, 0.55f, 0.65f, "cone", TexWood, false);
+            for (int h = 0; h < 6; ++h) {
+                float t = h * 0.95f;
+                float ang = h * 2.1f;
+                float rx = 0.48f * cosf(ang);
+                float rz = 0.48f * sinf(ang);
+                float yb = 1.05f + t * 0.38f;
+                addMazeProp(bx + rx, bz + rz, yb, 0.06f, 0.55f + h * 0.02f, 0.06f, "woodBox", TexWoodBridge, false);
+                addMazeProp(bx + rx * 1.05f, bz + rz * 1.05f, yb - 0.35f, 0.24f, 0.26f, 0.22f, "stoneBox", TexW12Skull, false);
+            }
+        }
+    }
+
+    // Courtyard between maze north and castle moat: skull spikes + gallows (world space; not maze colliders).
+    {
+        using namespace MazeConfig;
+        auto addCourtyardProp = [&](float cx, float cz, float yBottom, float sx, float sy, float sz,
+            const char* meshName, UINT texSlot, float yaw = 0.f)
+        {
+            const float cy = yBottom + 0.5f * sy;
+            auto p = std::make_unique<RenderItem>();
+            XMMATRIX world = XMMatrixScaling(sx, sy, sz) * XMMatrixRotationY(yaw) * XMMatrixTranslation(cx, cy, cz);
+            XMStoreFloat4x4(&p->World, world);
+            p->ObjCBIndex = objCBIndex++;
+            p->Geo = mGeometries["shapeGeo"].get();
+            const auto& sm = p->Geo->DrawArgs[meshName];
+            p->IndexCount = sm.IndexCount;
+            p->StartIndexLocation = sm.StartIndexLocation;
+            p->BaseVertexLocation = sm.BaseVertexLocation;
+            p->TexSrvHeapIndex = texSlot;
+            mAllRitems.push_back(std::move(p));
+        };
+
+        auto addCourtyardSpike = [&](float cx, float cz, float yawRad)
+        {
+            const float spH = 1.55f;
+            const float spR = 0.15f;
+            addCourtyardProp(cx, cz, 0.0f, spR, spH, spR, "cone", TexBrickBase, yawRad);
+            auto it = mGeometries.find("skullGeo");
+            if (it != mGeometries.end() && it->second) {
+                auto p = std::make_unique<RenderItem>();
+                XMMATRIX world = XMMatrixScaling(0.09f, 0.14f, 0.085f) * XMMatrixRotationY(yawRad + 0.4f) *
+                    XMMatrixTranslation(cx, spH, cz);
+                XMStoreFloat4x4(&p->World, world);
+                p->BaseColorMul = XMFLOAT3(0.88f, 0.85f, 0.82f);
+                p->ObjCBIndex = objCBIndex++;
+                p->Geo = it->second.get();
+                const auto& sm = p->Geo->DrawArgs["skull"];
+                p->IndexCount = sm.IndexCount;
+                p->StartIndexLocation = sm.StartIndexLocation;
+                p->BaseVertexLocation = sm.BaseVertexLocation;
+                p->TexSrvHeapIndex = TexW12Skull;
+                mAllRitems.push_back(std::move(p));
+            }
+            else {
+                addCourtyardProp(cx, cz, spH, 0.26f, 0.28f, 0.24f, "stoneBox", TexW12Skull, yawRad);
+            }
+        };
+
+        // Apron in front of moat gate / drawbridge landing (~z -19.5): props on sides only so bridge can lower (clear |x| < ~6).
+        const float czc = -19.55f;
+        addCourtyardSpike(-13.5f, czc, 0.35f);
+        addCourtyardSpike(-10.2f, czc, -0.25f);
+        addCourtyardSpike(-7.2f, czc, 0.5f);
+        addCourtyardSpike(7.2f, czc, -0.4f);
+        addCourtyardSpike(10.2f, czc, 0.2f);
+        addCourtyardSpike(13.5f, czc, -0.55f);
+
+        // Gallows: west side of landing (same Z strip), clear of bridge span.
+        const float gZ = -19.55f;
+        addCourtyardProp(-14.1f, gZ, 0.0f, 0.38f, 5.1f, 0.38f, "cylinderTrunk", TexWood, 0.f);
+        addCourtyardProp(-8.1f, gZ, 0.0f, 0.38f, 5.1f, 0.38f, "cylinderTrunk", TexWood, 0.f);
+        addCourtyardProp(-11.1f, gZ, 4.95f, 6.2f, 0.5f, 0.4f, "woodBox", TexWoodBridge, 0.f);
+        addCourtyardProp(-11.1f, gZ, 4.1f, 0.14f, 1.35f, 0.14f, "cylinderTrunk", TexWood, 0.f);
+        addCourtyardProp(-11.1f, gZ, 2.85f, 0.35f, 0.22f, 0.35f, "stoneBox", TexW12Skull, 0.15f);
+    }
 
     // Center fountain: opaque stone, then transparent TexWater cones/cylinder (each has its own Alpha).
 
@@ -1134,7 +1752,7 @@ void ShapesApp::BuildRenderItems()
         mAllRitems.push_back(std::move(beltUpper));
 
         auto roof = std::make_unique<RenderItem>();
-        // Tower top: sphere (expected by the A1 spec rubric).
+        // Tower top: sphere cap.
         XMStoreFloat4x4(&roof->World,
             XMMatrixScaling(4.0f, 4.0f, 4.0f) *
             XMMatrixTranslation(towerPos[i][0], 18.6f, towerPos[i][1]));
@@ -1146,9 +1764,7 @@ void ShapesApp::BuildRenderItems()
         roof->TexSrvHeapIndex = TexStoneTop;
         mAllRitems.push_back(std::move(roof));
 
-        // Decorative tower finials to ensure the 4 "new" A1 shapes render:
-        // - cone: small spike above the dome
-        // - triPrism: small triangular cap beside/above the dome
+        // Small finials: cone spike and triangular prism accent on the dome.
 
         auto coneFinial = std::make_unique<RenderItem>();
         XMStoreFloat4x4(
@@ -1313,7 +1929,7 @@ void ShapesApp::BuildRenderItems()
     }
 
     // Brick detail: horizontal bands + vertical buttresses (reuses wall textures).
-    // These are intentionally simple so they still read as "brickwork" in the demo view.
+    // These are intentionally simple so they still read as brickwork from a distance.
 
     // North wall bands and buttresses.
     {
@@ -1462,25 +2078,35 @@ void ShapesApp::BuildRenderItems()
         mAllRitems.push_back(std::move(tooth));
     }
 
-    // Trees: one point per tree; treeBillboard.hlsl expands to two crossed quads. Size comes from TexC in BuildTreeBillboardGeometry().
-    const float treeRadius = 34.0f;
-    for (int i = 0; i < 12; ++i) {
-        float angle = i * (XM_2PI / 12.0f);
-        float x = treeRadius * cosf(angle);
-        float z = treeRadius * sinf(angle);
-
-        auto tree = std::make_unique<RenderItem>();
-        // Y equals half-height stored in vertex TexC.y so the quad bottom sits near y = 0.
-        XMStoreFloat4x4(&tree->World, XMMatrixTranslation(x, 6.48f, z));
-        tree->BillboardTree = true;
-        tree->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
-        tree->ObjCBIndex = objCBIndex++;
-        tree->Geo = mGeometries["treeBillboardGeo"].get();
-        tree->IndexCount = 1;
-        tree->StartIndexLocation = (UINT)i;
-        tree->BaseVertexLocation = i;
-        tree->TexSrvHeapIndex = TexTreeLeaves;
-        mAllRitems.push_back(std::move(tree));
+    // Trees: only on the south front grass strip by the pool / outer water (not in the maze or island ring).
+    {
+        using namespace MazeConfig;
+        const float southPad = 28.0f;
+        const float poolZ = kOriginZ - 0.5f * southPad - 0.25f * kCell;
+        const float halfW = 0.5f * kCols * kCell;
+        const float treeGroundY = kTreeBillboardHalfH;
+        for (int i = 0; i < kBillboardTreeCount; ++i) {
+            const float fi = static_cast<float>(i);
+            const float u = fmodf(fi * 0.6180339f + 0.27f, 1.f);
+            const float v = fmodf(fi * 0.3791817f + 0.61f, 1.f);
+            const bool west = (i % 2 == 0);
+            float x = west ? (-halfW - 5.5f - u * 14.f) : (halfW + 5.5f + u * 14.f);
+            float z = poolZ - 3.5f - v * 16.f + sinf(fi * 2.17f) * 2.8f;
+            x += sinf(fi * 1.33f) * 2.2f;
+            if ((i % 7) == 3 || (i % 7) == 4)
+                z = poolZ - 1.2f - u * 6.f;
+            auto tree = std::make_unique<RenderItem>();
+            XMStoreFloat4x4(&tree->World, XMMatrixTranslation(x, treeGroundY, z));
+            tree->BillboardTree = true;
+            tree->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+            tree->ObjCBIndex = objCBIndex++;
+            tree->Geo = mGeometries["treeBillboardGeo"].get();
+            tree->IndexCount = 1;
+            tree->StartIndexLocation = (UINT)i;
+            tree->BaseVertexLocation = i;
+            tree->TexSrvHeapIndex = TexTreeLeaves;
+            mAllRitems.push_back(std::move(tree));
+        }
     }
 
     // 5. THE DRAWBRIDGE
@@ -1537,7 +2163,7 @@ void ShapesApp::BuildRenderItems()
     mAllRitems.push_back(std::move(hinge));
 
     // Chains at the top corners that conceptually "hold" and lift the bridge.
-    // Represented as thin wood beams for this assignment.
+    // Represented as thin wood beams.
     float chainOffsetX[2] = { -railX, railX };
     for (int ci = 0; ci < 2; ++ci) {
         auto chain = std::make_unique<RenderItem>();

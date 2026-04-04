@@ -137,6 +137,7 @@
     <ClCompile Include="..\..\Common\GeometryGenerator.cpp" />
     <ClCompile Include="..\..\Common\MathHelper.cpp" />
     <ClCompile Include="FrameResource.cpp" />
+    <ClCompile Include="SkullTxtMesh.cpp" />
     <ClCompile Include="Week4-6-ShapeComplete.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -150,6 +151,24 @@
     <ClInclude Include="..\..\Common\MathHelper.h" />
     <ClInclude Include="..\..\Common\UploadBuffer.h" />
     <ClInclude Include="FrameResource.h" />
+    <ClInclude Include="SkullTxtMesh.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Shaders\color.hlsl" />
+    <None Include="Shaders\treeBillboard.hlsl" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\Textures\stone.dds" />
+    <None Include="..\..\Textures\tile.dds" />
+    <None Include="..\..\Textures\skull_crossbones_DXT5.dds" />
+    <None Include="..\..\Textures\bricks2.dds" />
+    <None Include="..\..\Textures\bricks.dds" />
+    <None Include="..\..\Textures\WoodCrate01.dds" />
+    <None Include="..\..\Textures\WoodCrate02.dds" />
+    <None Include="..\..\Textures\grass.dds" />
+    <None Include="..\..\Textures\water1.dds" />
+    <None Include="..\..\Textures\treearray.dds" />
+    <None Include="Models\skull.txt" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

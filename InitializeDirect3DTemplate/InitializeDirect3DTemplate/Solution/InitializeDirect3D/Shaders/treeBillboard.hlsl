@@ -2,7 +2,7 @@
 // C++: BuildTreeBillboardGeometry stores half-width and half-height in vertex TexC; lighting matches color.hlsl.
 
 #define NUM_DIR_LIGHTS 1
-#define NUM_POINT_LIGHTS 3
+#define NUM_POINT_LIGHTS 4
 #define NUM_SPOT_LIGHTS 0
 #define MaxLights 16
 
@@ -19,10 +19,11 @@ struct Light
 cbuffer cbPerObject : register(b0)
 {
     float4x4 gWorld;
+    float4x4 gTexTransform;
     float gAlpha;
     float3 gBaseColorMul;
     float gBaseColorMulPad;
-    float gWaterSurfaceUv; // unused; matches color.hlsl / C++ padding
+    float gWaterSurfaceUv;
     float gPadCb0;
     float gPadCb1;
 };

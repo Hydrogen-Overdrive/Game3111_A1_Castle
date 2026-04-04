@@ -8,6 +8,7 @@
 struct ObjectConstants
 {
     DirectX::XMFLOAT4X4 World = MathHelper::Identity4x4();
+    DirectX::XMFLOAT4X4 TexTransform = MathHelper::Identity4x4();
     float Alpha = 1.0f;
     DirectX::XMFLOAT3 BaseColorMul = { 1.0f, 1.0f, 1.0f };
     float BaseColorMulPad = 0.0f;

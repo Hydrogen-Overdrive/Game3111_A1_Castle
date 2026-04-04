@@ -1,2 +1,3 @@
 # Game3111_A1_Castle
-assignement1 directx12 hooman class
+
+DirectX 12 castle scene (Game 3111 assignment).
