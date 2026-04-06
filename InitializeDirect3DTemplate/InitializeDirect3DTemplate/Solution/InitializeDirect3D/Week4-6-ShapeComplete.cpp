@@ -1,5 +1,16 @@
 /** @file Week4-6-ShapeComplete.cpp
  *  Castle scene: textures, Blinn-Phong lighting, alpha-blended water, billboard trees (geometry shader), maze walkthrough.
+ *
+ *  Recent layout / gameplay notes (for readers new to the file):
+ *  - Maze grid (MazeConfig::kLines): ASCII rows drive wall meshes and colliders; '#' is solid. The castle end
+ *    includes wide centre openings for a drawbridge yard; the old single hedge row was removed so the yard
+ *    opens toward the castle. Row indices increase toward the castle; the last row is still maze-driven.
+ *  - Trees: two rings of billboard points (inner preserves the original 12 angles at radius 34; outer ring
+ *    fills the island). Samples that fall inside the maze bounding box are pushed outward so trees stay off paths.
+ *  - Walking: PlayerIntersectsMaze uses an axis-aligned box around the body. kCameraNearZ tightens the view
+ *    frustum near plane (smaller than 1.0) so walls do not disappear when you stand close; kPlayerHalfXZ and
+ *    kPlayerMoveSubsteps reduce clipping and fast-move tunneling through thin colliders.
+ *  - Courtyard props (spikes, gallows) use yard Z derived from the last maze row when no separate hedge row exists.
  */
 
 #include "../../Common/d3dApp.h"
@@ -21,11 +32,10 @@ using namespace DirectX::PackedVector;
 
 const int gNumFrameResources = 3;
 
-// Billboard trees: all placed on the south “front lawn” by the water (none inside / around maze sides).
-static constexpr int kBillboardRingTrees = 0;
-static constexpr int kBillboardMazeFrontTrees = 0;
-static constexpr int kBillboardEntranceForestTrees = 84;
-static constexpr int kBillboardTreeCount = kBillboardEntranceForestTrees;
+// Billboard trees: two rings (inner = 12 trees at fixed radius; outer = 30 trees) for perimeter coverage.
+static constexpr int kBillboardOriginalRingTrees = 12;
+static constexpr int kBillboardOuterRingTrees = 30;
+static constexpr int kBillboardTreeCount = kBillboardOriginalRingTrees + kBillboardOuterRingTrees;
 static constexpr float kTreeBillboardHalfW = 4.5f;
 static constexpr float kTreeBillboardHalfH = 4.75f; // world Y = this so billboard base meets ground
 
@@ -38,20 +48,28 @@ struct AxisAlignedCollider
 namespace MazeConfig {
 constexpr float kCell = 1.65f;
 // U-shaped (3-sided) maze: long walls on west, south, east; open north toward the castle (back).
-constexpr int kRows = 31;
+constexpr int kYardOpenRows = 0; // hedge row removed — open yard for gallows / drawbridge
+constexpr int kRows = 26 + kYardOpenRows; // labyrinth only (= 26)
 constexpr int kCols = 23;
 constexpr float kOriginX = -0.5f * kCols * kCell;
 // Maze sits in front of the castle; north edge opens to the bridge / gate (castle is the goal at the back).
 // Wall half-depth in Z matches BuildRenderItems (kCell * 0.92f).
 constexpr float kWallScaleZ = 0.92f;
+// Shift last maze row in Z vs grid; 0 = aligned with maze grid (no pull toward moat).
+constexpr float kLastRowZOffsetTowardCastle = 0.0f;
 constexpr float kMazeNorthEdgeZ = -19.0f;
 constexpr float kOriginZ =
     kMazeNorthEdgeZ - (static_cast<float>(kRows) - 0.5f + 0.5f * kWallScaleZ) * kCell;
 constexpr float kWallHeight = 3.0f;
 constexpr float kEyeHeight = 2.45f;
-constexpr float kPlayerHalfXZ = 0.38f;
+// Player collision box half-extents (XZ horizontal, Y vertical). Slightly wider XZ stops the camera before it hugs the wall mesh.
+constexpr float kPlayerHalfXZ = 0.52f;
 constexpr float kPlayerHalfY = 0.95f;
 constexpr float kPlayerBodyCenterY = 1.0f;
+// Perspective near plane (world units). Smaller values let the renderer draw geometry closer to the eye; 1.0f made walls vanish when near.
+constexpr float kCameraNearZ = 0.08f;
+// How many collision checks per frame along the move vector (avoids skipping past a thin wall in one big step).
+constexpr int kPlayerMoveSubsteps = 8;
 
 inline bool AabbOverlap(const XMFLOAT3& ca, const XMFLOAT3& ha, const XMFLOAT3& cb, const XMFLOAT3& hb)
 {
@@ -60,9 +78,9 @@ inline bool AabbOverlap(const XMFLOAT3& ca, const XMFLOAT3& ha, const XMFLOAT3& 
         && fabsf(ca.z - cb.z) <= ha.z + hb.z;
 }
 
-// '#' = wall. Carved labyrinth. Row 0 = entrance; north row opens toward bridge (no extra row under drawbridge).
+// '#' = wall. Labyrinth, then open yard rows, then gate. Row 0 = entrance (wide center gap for drawbridge).
 const char* const kLines[kRows] = {
-    "#########     #########",
+    "########       ########",
     "#     #     #   #     #",
     "# # ### ##### # # # # #",
     "# # #   #     # # # # #",
@@ -85,14 +103,10 @@ const char* const kLines[kRows] = {
     "# # ##### ### ### #####",
     "# # #   #   #     #   #",
     "# # # # # # ####### # #",
-    "# # # # # #         # #",
-    "# # # # ############# #",
-    "# #   #               #",
-    "# ################### #",
+    // Drawbridge yard: outer boundary # only; wide centre opening (same on two rows).
+    "#                     #",
+    "#                     #",
     "# #             #     #",
-    "# # ##### ####### #####",
-    "#       #             #",
-    "#########     #########",
 };
 } // namespace MazeConfig
 
@@ -271,7 +285,8 @@ bool ShapesApp::Initialize()
 void ShapesApp::OnResize()
 {
     D3DApp::OnResize();
-    mCamera.SetLens(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
+    // Near/far must stay in sync with UpdateMainPassCB (shader uses the same near distance for lighting math).
+    mCamera.SetLens(0.25f * MathHelper::Pi, AspectRatio(), MazeConfig::kCameraNearZ, 1000.0f);
     XMMATRIX P = mCamera.GetProj();
     XMStoreFloat4x4(&mProj, P);
 }
@@ -386,6 +401,7 @@ void ShapesApp::OnMouseMove(WPARAM btnState, int x, int y)
 
 void ShapesApp::OnKeyboardInput(const GameTimer& gt)
 {
+    using namespace MazeConfig;
     mIsWireframe = (GetAsyncKeyState('1') & 0x8000);
 
     const float dt = gt.DeltaTime();
@@ -461,21 +477,26 @@ void ShapesApp::OnKeyboardInput(const GameTimer& gt)
         pos.z += delta.z;
     }
     else {
-        const float nx = pos.x + delta.x;
-        const float nz = pos.z + delta.z;
+        // Sub-step horizontal motion: same sliding test as before, but in smaller pieces so we do not miss a wall between frames.
+        const float subX = delta.x / static_cast<float>(kPlayerMoveSubsteps);
+        const float subZ = delta.z / static_cast<float>(kPlayerMoveSubsteps);
+        for (int step = 0; step < kPlayerMoveSubsteps; ++step) {
+            const float nx = pos.x + subX;
+            const float nz = pos.z + subZ;
 
-        XMFLOAT3 tryFull(nx, pos.y, nz);
-        if (!PlayerIntersectsMaze(tryFull)) {
-            pos.x = nx;
-            pos.z = nz;
-        }
-        else {
-            XMFLOAT3 tryX(nx, pos.y, pos.z);
-            if (!PlayerIntersectsMaze(tryX))
+            const XMFLOAT3 tryFull(nx, pos.y, nz);
+            if (!PlayerIntersectsMaze(tryFull)) {
                 pos.x = nx;
-            XMFLOAT3 tryZ(pos.x, pos.y, nz);
-            if (!PlayerIntersectsMaze(tryZ))
                 pos.z = nz;
+            }
+            else {
+                const XMFLOAT3 tryX(nx, pos.y, pos.z);
+                if (!PlayerIntersectsMaze(tryX))
+                    pos.x = nx;
+                const XMFLOAT3 tryZ(pos.x, pos.y, nz);
+                if (!PlayerIntersectsMaze(tryZ))
+                    pos.z = nz;
+            }
         }
     }
 
@@ -559,7 +580,8 @@ void ShapesApp::UpdateMainPassCB(const GameTimer& gt) {
     mMainPassCB.EyePosW = mEyePos;
     mMainPassCB.RenderTargetSize = XMFLOAT2((float)mClientWidth, (float)mClientHeight);
     mMainPassCB.InvRenderTargetSize = XMFLOAT2(1.0f / mClientWidth, 1.0f / mClientHeight);
-    mMainPassCB.NearZ = 1.0f; mMainPassCB.FarZ = 1000.0f;
+    mMainPassCB.NearZ = mCamera.GetNearZ();
+    mMainPassCB.FarZ = mCamera.GetFarZ();
     mMainPassCB.TotalTime = gt.TotalTime(); mMainPassCB.DeltaTime = gt.DeltaTime();
 
     // Pass constants feed color.hlsl and treeBillboard.hlsl (gAmbientLight, gLights, gTotalTime).
@@ -1325,7 +1347,9 @@ void ShapesApp::BuildRenderItems()
                 if (kLines[r][c] != '#')
                     continue;
                 const float wx = kOriginX + (c + 0.5f) * kCell;
-                const float wz = kOriginZ + (r + 0.5f) * kCell;
+                float wz = kOriginZ + (r + 0.5f) * kCell;
+                if (r == kRows - 1)
+                    wz += kLastRowZOffsetTowardCastle;
                 const float wy = 0.5f * kWallHeight;
 
                 AxisAlignedCollider box;
@@ -1410,7 +1434,10 @@ void ShapesApp::BuildRenderItems()
 
         auto cellXZ = [&](int row, int col) -> XMFLOAT2
         {
-            return XMFLOAT2(kOriginX + (col + 0.5f) * kCell, kOriginZ + (row + 0.5f) * kCell);
+            float z = kOriginZ + (row + 0.5f) * kCell;
+            if (row == kRows - 1)
+                z += kLastRowZOffsetTowardCastle;
+            return XMFLOAT2(kOriginX + (col + 0.5f) * kCell, z);
         };
 
         auto addPodium = [&](float cx, float cz)
@@ -1596,8 +1623,9 @@ void ShapesApp::BuildRenderItems()
             }
         };
 
-        // Apron in front of moat gate / drawbridge landing (~z -19.5): props on sides only so bridge can lower (clear |x| < ~6).
-        const float czc = -19.55f;
+        // Courtyard props: Z at centre of last maze row (no hedge band).
+        const float yardZ = kOriginZ + (static_cast<float>(kRows) - 0.5f) * kCell + kLastRowZOffsetTowardCastle;
+        const float czc = yardZ;
         addCourtyardSpike(-13.5f, czc, 0.35f);
         addCourtyardSpike(-10.2f, czc, -0.25f);
         addCourtyardSpike(-7.2f, czc, 0.5f);
@@ -1605,13 +1633,17 @@ void ShapesApp::BuildRenderItems()
         addCourtyardSpike(10.2f, czc, 0.2f);
         addCourtyardSpike(13.5f, czc, -0.55f);
 
-        // Gallows: west side of landing (same Z strip), clear of bridge span.
-        const float gZ = -19.55f;
-        addCourtyardProp(-14.1f, gZ, 0.0f, 0.38f, 5.1f, 0.38f, "cylinderTrunk", TexWood, 0.f);
-        addCourtyardProp(-8.1f, gZ, 0.0f, 0.38f, 5.1f, 0.38f, "cylinderTrunk", TexWood, 0.f);
-        addCourtyardProp(-11.1f, gZ, 4.95f, 6.2f, 0.5f, 0.4f, "woodBox", TexWoodBridge, 0.f);
-        addCourtyardProp(-11.1f, gZ, 4.1f, 0.14f, 1.35f, 0.14f, "cylinderTrunk", TexWood, 0.f);
-        addCourtyardProp(-11.1f, gZ, 2.85f, 0.35f, 0.22f, 0.35f, "stoneBox", TexW12Skull, 0.15f);
+        // Gallows: H shape — beam is 6.2 wide in X; posts sit near ±half width so they meet the cross piece.
+        const float gZ = yardZ - 1.05f * kCell;
+        const float gXCross = -11.4f; // cross + rope + skull; nudged right vs old -12.5
+        const float gHalfBeamX = 0.5f * 6.2f; // matches woodBox X scale
+        const float gXLeftPost = gXCross - gHalfBeamX;
+        const float gXRightPost = gXCross + gHalfBeamX;
+        addCourtyardProp(gXLeftPost, gZ, 0.0f, 0.38f, 5.1f, 0.38f, "cylinderTrunk", TexWood, 0.f);
+        addCourtyardProp(gXRightPost, gZ, 0.0f, 0.38f, 5.1f, 0.38f, "cylinderTrunk", TexWood, 0.f);
+        addCourtyardProp(gXCross, gZ, 4.95f, 6.2f, 0.5f, 0.4f, "woodBox", TexWoodBridge, 0.f);
+        addCourtyardProp(gXCross, gZ, 4.1f, 0.14f, 1.35f, 0.14f, "cylinderTrunk", TexWood, 0.f);
+        addCourtyardProp(gXCross, gZ, 2.85f, 0.35f, 0.22f, 0.35f, "stoneBox", TexW12Skull, 0.15f);
     }
 
     // Center fountain: opaque stone, then transparent TexWater cones/cylinder (each has its own Alpha).
@@ -2078,23 +2110,51 @@ void ShapesApp::BuildRenderItems()
         mAllRitems.push_back(std::move(tooth));
     }
 
-    // Trees: only on the south front grass strip by the pool / outer water (not in the maze or island ring).
+    // Trees: rings around world origin; any sample inside the maze footprint is pushed outward (billboards stay off the maze).
     {
         using namespace MazeConfig;
-        const float southPad = 28.0f;
-        const float poolZ = kOriginZ - 0.5f * southPad - 0.25f * kCell;
-        const float halfW = 0.5f * kCols * kCell;
+        const float treeRadiusInner = 34.0f;
+        const float treeInset = 3.5f;
+        const float R = outerBound - treeInset;
         const float treeGroundY = kTreeBillboardHalfH;
-        for (int i = 0; i < kBillboardTreeCount; ++i) {
-            const float fi = static_cast<float>(i);
-            const float u = fmodf(fi * 0.6180339f + 0.27f, 1.f);
-            const float v = fmodf(fi * 0.3791817f + 0.61f, 1.f);
-            const bool west = (i % 2 == 0);
-            float x = west ? (-halfW - 5.5f - u * 14.f) : (halfW + 5.5f + u * 14.f);
-            float z = poolZ - 3.5f - v * 16.f + sinf(fi * 2.17f) * 2.8f;
-            x += sinf(fi * 1.33f) * 2.2f;
-            if ((i % 7) == 3 || (i % 7) == 4)
-                z = poolZ - 1.2f - u * 6.f;
+        const float mazePad = kTreeBillboardHalfW + 2.0f;
+        const float mazeMinX = kOriginX - mazePad;
+        const float mazeMaxX = kOriginX + static_cast<float>(kCols) * kCell + mazePad;
+        const float mazeMinZ = kOriginZ - mazePad;
+        const float mazeMaxZ =
+            kOriginZ + static_cast<float>(kRows) * kCell + mazePad + kLastRowZOffsetTowardCastle;
+
+        auto pushOutsideMazeFootprint = [&](float px, float pz) {
+            if (px > mazeMinX && px < mazeMaxX && pz > mazeMinZ && pz < mazeMaxZ) {
+                float len0 = sqrtf(px * px + pz * pz);
+                if (len0 < 1e-3f) {
+                    px = 1.0f;
+                    pz = 0.0f;
+                    len0 = 1.0f;
+                }
+                const float ux = px / len0;
+                const float uz = pz / len0;
+                float t = len0;
+                for (int s = 0; s < 160; ++s) {
+                    const float qx = t * ux;
+                    const float qz = t * uz;
+                    if (qx <= mazeMinX || qx >= mazeMaxX || qz <= mazeMinZ || qz >= mazeMaxZ)
+                        return XMFLOAT2(qx, qz);
+                    t += 0.55f;
+                }
+                return XMFLOAT2(ux * (outerBound - 1.0f), uz * (outerBound - 1.0f));
+            }
+            return XMFLOAT2(px, pz);
+        };
+
+        int ti = 0;
+        for (int i = 0; i < kBillboardOriginalRingTrees; ++i) {
+            const float angle = static_cast<float>(i) * (XM_2PI / static_cast<float>(kBillboardOriginalRingTrees));
+            float x = treeRadiusInner * cosf(angle);
+            float z = treeRadiusInner * sinf(angle);
+            XMFLOAT2 xz = pushOutsideMazeFootprint(x, z);
+            x = xz.x;
+            z = xz.y;
             auto tree = std::make_unique<RenderItem>();
             XMStoreFloat4x4(&tree->World, XMMatrixTranslation(x, treeGroundY, z));
             tree->BillboardTree = true;
@@ -2102,11 +2162,34 @@ void ShapesApp::BuildRenderItems()
             tree->ObjCBIndex = objCBIndex++;
             tree->Geo = mGeometries["treeBillboardGeo"].get();
             tree->IndexCount = 1;
-            tree->StartIndexLocation = (UINT)i;
-            tree->BaseVertexLocation = i;
+            tree->StartIndexLocation = (UINT)ti;
+            tree->BaseVertexLocation = ti++;
             tree->TexSrvHeapIndex = TexTreeLeaves;
             mAllRitems.push_back(std::move(tree));
         }
+        for (int i = 0; i < kBillboardOuterRingTrees; ++i) {
+            const float angle =
+                (static_cast<float>(i) + 0.5f) * (XM_2PI / static_cast<float>(kBillboardOuterRingTrees));
+            float x = R * cosf(angle);
+            float z = R * sinf(angle);
+            XMFLOAT2 xz = pushOutsideMazeFootprint(x, z);
+            x = xz.x;
+            z = xz.y;
+            auto tree = std::make_unique<RenderItem>();
+            XMStoreFloat4x4(&tree->World, XMMatrixTranslation(x, treeGroundY, z));
+            tree->BillboardTree = true;
+            tree->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+            tree->ObjCBIndex = objCBIndex++;
+            tree->Geo = mGeometries["treeBillboardGeo"].get();
+            tree->IndexCount = 1;
+            tree->StartIndexLocation = (UINT)ti;
+            tree->BaseVertexLocation = ti++;
+            tree->TexSrvHeapIndex = TexTreeLeaves;
+            mAllRitems.push_back(std::move(tree));
+        }
+        static_assert(
+            kBillboardOriginalRingTrees + kBillboardOuterRingTrees == kBillboardTreeCount,
+            "tree budget");
     }
 
     // 5. THE DRAWBRIDGE
@@ -2161,26 +2244,6 @@ void ShapesApp::BuildRenderItems()
     hinge->BaseVertexLocation = hinge->Geo->DrawArgs["woodBox"].BaseVertexLocation;
     hinge->TexSrvHeapIndex = TexWoodBridge;
     mAllRitems.push_back(std::move(hinge));
-
-    // Chains at the top corners that conceptually "hold" and lift the bridge.
-    // Represented as thin wood beams.
-    float chainOffsetX[2] = { -railX, railX };
-    for (int ci = 0; ci < 2; ++ci) {
-        auto chain = std::make_unique<RenderItem>();
-        // Slight angle matching the bridge tilt.
-        XMMATRIX chainWorld =
-            XMMatrixScaling(0.12f, 1.25f, 0.12f) *
-            XMMatrixRotationX(XMConvertToRadians(-55.0f)) *
-            XMMatrixTranslation(chainOffsetX[ci], 3.75f, -18.3f + (ci == 0 ? -0.6f : 0.6f));
-        XMStoreFloat4x4(&chain->World, chainWorld);
-        chain->ObjCBIndex = objCBIndex++;
-        chain->Geo = mGeometries["shapeGeo"].get();
-        chain->IndexCount = chain->Geo->DrawArgs["woodBox"].IndexCount;
-        chain->StartIndexLocation = chain->Geo->DrawArgs["woodBox"].StartIndexLocation;
-        chain->BaseVertexLocation = chain->Geo->DrawArgs["woodBox"].BaseVertexLocation;
-        chain->TexSrvHeapIndex = TexWoodBridge;
-        mAllRitems.push_back(std::move(chain));
-    }
 
     // Draw order lists: TexWater uses transparent PSO; trees use tree PSO; rest opaque.
     for (auto& e : mAllRitems) {
